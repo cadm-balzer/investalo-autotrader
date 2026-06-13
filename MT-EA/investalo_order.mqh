@@ -285,13 +285,15 @@ void SendAcknowledgment(string signalId, bool success)
    CJAVal ackBody;
    ackBody["success"] = success;
    if(!success) ackBody["error_message"] = "Execution failed inside MT5 terminal.";
-   else ackBody["error_message"] = "";
    
    string jsonPost = ackBody.Serialize();
    char post[], result[];
    string result_headers;
    
-   StringToCharArray(jsonPost, post, 0, WHOLE_ARRAY, CP_UTF8);
+   // WICHTIG: Länge des JSON-Strings, OHNE das von StringToCharArray angehängte
+   // Null-Byte. Sonst erhält FastAPI ein '\0' im Body und antwortet mit 422.
+   int len = StringToCharArray(jsonPost, post, 0, StringLen(jsonPost), CP_UTF8);
+   ArrayResize(post, StringLen(jsonPost));
    
    int res = WebRequest("POST", url, headers, 500, post, result, result_headers);
    if(res == 200)

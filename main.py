@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -68,10 +69,17 @@ class WebhookPayload(BaseModel):
 class AckPayload(BaseModel):
     """Quittung des MT5 EA nach Ausführung (oder Fehler)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     success: bool
     error_message: str | None = Field(default=None, max_length=512)
+
+    @field_validator("error_message", mode="before")
+    @classmethod
+    def _empty_to_none(cls, v: Any) -> Any:
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
 
 class StoredSignal(BaseModel):
@@ -268,6 +276,20 @@ async def ack(
 # ---------------------------------------------------------------------------
 # Globaler Exception-Handler – nie Stacktrace an Clients
 # ---------------------------------------------------------------------------
+@app.exception_handler(RequestValidationError)
+async def _validation(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422-Antworten mit Body-Echo loggen – hilft beim Debuggen von MT5/TV-Payloads."""
+    raw = await request.body()
+    log.warning(
+        "422 %s %s | body=%r | errors=%s",
+        request.method,
+        request.url.path,
+        raw[:1000],
+        exc.errors(),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 @app.exception_handler(Exception)
 async def _unhandled(_: Request, exc: Exception) -> JSONResponse:
     log.exception("unhandled: %s", exc)
