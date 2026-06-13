@@ -1,7 +1,7 @@
 services:
   autotrader:
     build: .
-    image: investalo/autotrader:latest
+    image: ghcr.io/cadm-balzer/investalo-autotrader:latest
     container_name: investalo-autotrader
     restart: unless-stopped
     ports:
