@@ -38,7 +38,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("autotrader")
 
-ActionT = Literal["BUY", "SELL", "PARTIAL_CLOSE", "CLOSE_ALL", "BREAKEVEN"]
+ActionT = Literal[
+    "BUY",
+    "SELL",
+    "BUY_LIMIT",
+    "SELL_LIMIT",
+    "PARTIAL_CLOSE",
+    "CLOSE_ALL",
+    "BREAKEVEN",
+]
 StatusT = Literal["PENDING", "DISPATCHED", "EXECUTED", "FAILED"]
 
 # ---------------------------------------------------------------------------

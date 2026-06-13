@@ -152,41 +152,44 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
       return MoveToBreakeven(symbol);
    }
 
-   // 2. NEUE TRADES (BUY / SELL)
+   // 2. NEUE TRADES (Market & Limit)
+   bool isBuy   = (action == "BUY"  || action == "BUY_LIMIT");
+   bool isSell  = (action == "SELL" || action == "SELL_LIMIT");
+   bool isEntry = isBuy || isSell;
+   string side  = isBuy ? "BUY" : "SELL";
+
    double lotSize = 0.0;
-   
-   if(action == "BUY" || action == "SELL")
+   if(isEntry)
    {
       if(sl <= 0)
       {
          Print("Fehler: Für risiko-basierte Lots wird ein valider SL-Preis benötigt.");
          return false;
       }
-      
-      // Dynamische Lot-Berechnung anhand des Kontostands (Equity) und des SL-Abstands
-      lotSize = CalculateLotSize(symbol, action, sl);
+      lotSize = CalculateLotSize(symbol, side, sl);
       if(lotSize <= 0) return false;
    }
-   
-   // Order-Platzierung
+
+   // Order-Platzierung – strikt: BUY/SELL = Market JETZT, *_LIMIT = pending
    if(action == "BUY")
    {
-      // Da wir Limit-Orders nutzen: Wenn TV-Preis unter dem aktuellen Ask liegt -> Limit Order, sonst Market
       double currentAsk = SymbolInfoDouble(symbol, SYMBOL_ASK);
-      if(price < currentAsk)
-         return trade.BuyLimit(lotSize, price, symbol, sl, tp1, ORDER_TIME_DAY);
-      else
-         return trade.Buy(lotSize, symbol, currentAsk, sl, tp1);
+      return trade.Buy(lotSize, symbol, currentAsk, sl, tp1);
+   }
+   else if(action == "BUY_LIMIT")
+   {
+      return trade.BuyLimit(lotSize, price, symbol, sl, tp1, ORDER_TIME_DAY);
    }
    else if(action == "SELL")
    {
       double currentBid = SymbolInfoDouble(symbol, SYMBOL_BID);
-      if(price > currentBid)
-         return trade.SellLimit(lotSize, price, symbol, sl, tp1, ORDER_TIME_DAY);
-      else
-         return trade.Sell(lotSize, symbol, currentBid, sl, tp1);
+      return trade.Sell(lotSize, symbol, currentBid, sl, tp1);
    }
-   
+   else if(action == "SELL_LIMIT")
+   {
+      return trade.SellLimit(lotSize, price, symbol, sl, tp1, ORDER_TIME_DAY);
+   }
+
    Print("Aktion '", action, "' wird aktuell nicht unterstützt.");
    return false;
 }
