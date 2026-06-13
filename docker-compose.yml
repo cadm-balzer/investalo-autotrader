@@ -1,0 +1,20 @@
+services:
+  autotrader:
+    build: .
+    image: investalo/autotrader:latest
+    container_name: investalo-autotrader
+    restart: unless-stopped
+    ports:
+      - "3005:3005"
+    environment:
+      LOG_LEVEL: INFO
+      DATA_DIR: /app/data
+      TOKENS_FILE: /app/tokens.json
+    volumes:
+      - ./data:/app/data
+      - ./tokens.json:/app/tokens.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:3005/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
