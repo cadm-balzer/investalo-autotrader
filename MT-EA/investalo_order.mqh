@@ -110,10 +110,10 @@ void FetchAndExecuteSignals()
       string signalId = signal["signal_id"].ToStr();
       string action   = signal["payload"]["action"].ToStr();
       string symbol   = signal["payload"]["symbol"].ToStr();
-      double price    = signal["payload"]["price"].ToDouble();
-      double sl       = signal["payload"]["sl"].ToDouble();
-      double tp1      = signal["payload"]["tp1"].ToDouble();
-      double tp2      = signal["payload"]["tp2"].ToDouble();
+      double price    = signal["payload"]["price"].ToDbl();
+      double sl       = signal["payload"]["sl"].ToDbl();
+      double tp1      = signal["payload"]["tp1"].ToDbl();
+      double tp2      = signal["payload"]["tp2"].ToDbl();
       int    qtyPct   = (int)signal["payload"]["qty_pct"].ToInt();
       
       Print("Signal empfangen! ID: ", signalId, " | Action: ", action, " | Asset: ", symbol);
@@ -209,13 +209,13 @@ double CalculateLotSize(string symbol, string action, double slPrice)
    if(tickSize <= 0 || tickValue <= 0) return 0.0;
    
    // Abstand in Punkten berechnen
-   double pointsDistance = math.abs(entryPrice - slPrice);
+   double pointsDistance = MathAbs(entryPrice - slPrice);
    
    // Lot-Berechnung über Tick-Value-Formel
    double lot = riskAmount / ((pointsDistance / tickSize) * tickValue);
    
    // Runden auf den nächsten erlaubten Lot-Schritt (Lot Step)
-   lot = math.round(lot / lotStep) * lotStep;
+   lot = MathRound(lot / lotStep) * lotStep;
    
    // Validierung gegen Broker-Grenzen
    if(lot < minLot) lot = minLot;
