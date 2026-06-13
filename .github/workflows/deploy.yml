@@ -81,6 +81,8 @@ jobs:
             
             cd /opt/investalo/investalo-autotrader
             
+            git pull 
+            
             # Latest Image pullen
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             
