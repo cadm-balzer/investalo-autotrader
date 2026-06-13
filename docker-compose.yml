@@ -5,7 +5,7 @@ services:
     container_name: investalo-autotrader
     restart: unless-stopped
     ports:
-      - "3005:3005"
+      - "127.0.0.1:3005:3005"
     environment:
       LOG_LEVEL: INFO
       DATA_DIR: /app/data
