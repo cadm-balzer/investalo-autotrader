@@ -35,8 +35,16 @@ TOKENS_FILE = Path(os.getenv("TOKENS_FILE", BASE_DIR / "tokens.json"))
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("autotrader")
+
+# uvicorn bringt eigene Handler ohne Timestamp mit -> wir vereinheitlichen
+# alles auf das Root-Format (asctime im Prefix).
+for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _lg = logging.getLogger(_name)
+    _lg.handlers.clear()
+    _lg.propagate = True
 
 ActionT = Literal[
     "BUY",
