@@ -25,6 +25,12 @@ input group "--- RISK Engine ---"
 input double   InpRiskPercent    = 0.5;                             // Risiko pro Trade (%) vom Kontostand
 input double   InpMaxLotSize     = 10.0;                            // Maximal erlaubte Lot-Größe
 
+input group "--- SYMBOL MAPPING (TradingView -> Broker) ---"
+// Format: "TV1=BROKER1,TV2=BROKER2"  (z.B. "US500=US500.cash,NAS100=NAS100.cash,GER40=DE40.cash")
+// Leer lassen, wenn die Symbole bei Broker und TradingView identisch sind.
+input string   InpSymbolMap      = "US500=US500.cash,NAS100=NAS100.cash";
+input string   InpSymbolSuffix   = "";                              // Optional: Suffix an ALLE Symbole anhängen (z.B. ".cash")
+
 //--- Globale Variablen ---
 ulong  PollingTimerID;
 string TypeToClose = "";
@@ -107,15 +113,18 @@ void FetchAndExecuteSignals()
       
       // Da die API ein Array zurückgibt, holen wir uns das erste Element (Index 0)
       CJAVal signal = jsonRoot[0];
-      string signalId = signal["signal_id"].ToStr();
-      string action   = signal["payload"]["action"].ToStr();
-      string symbol   = signal["payload"]["symbol"].ToStr();
-      double price    = signal["payload"]["price"].ToDbl();
-      double sl       = signal["payload"]["sl"].ToDbl();
-      double tp1      = signal["payload"]["tp1"].ToDbl();
-      double tp2      = signal["payload"]["tp2"].ToDbl();
-      int    qtyPct   = (int)signal["payload"]["qty_pct"].ToInt();
+      string signalId  = signal["signal_id"].ToStr();
+      string action    = signal["payload"]["action"].ToStr();
+      string tvSymbol  = signal["payload"]["symbol"].ToStr();
+      string symbol    = MapSymbol(tvSymbol);
+      double price     = signal["payload"]["price"].ToDbl();
+      double sl        = signal["payload"]["sl"].ToDbl();
+      double tp1       = signal["payload"]["tp1"].ToDbl();
+      double tp2       = signal["payload"]["tp2"].ToDbl();
+      int    qtyPct    = (int)signal["payload"]["qty_pct"].ToInt();
       
+      if(symbol != tvSymbol)
+         PrintFormat("Symbol-Mapping: %s -> %s", tvSymbol, symbol);
       Print("Signal empfangen! ID: ", signalId, " | Action: ", action, " | Asset: ", symbol);
       
       // Signal an die Order-Execution übergeben
@@ -302,4 +311,46 @@ void SendAcknowledgment(string signalId, bool success)
    {
       Print("Fehler beim Senden der Quittung an API. HTTP-Code: ", res);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Mappt ein TradingView-Symbol auf den Broker-Namen                |
+//| Reihenfolge: 1) explizites Mapping aus InpSymbolMap              |
+//|              2) Suffix aus InpSymbolSuffix anhängen, wenn nötig  |
+//|              3) unverändert zurückgeben                          |
+//+------------------------------------------------------------------+
+string MapSymbol(string tvSymbol)
+{
+   string src = tvSymbol;
+   StringTrimLeft(src);
+   StringTrimRight(src);
+
+   // 1) explizites Mapping "TV=BROKER,TV2=BROKER2"
+   if(StringLen(InpSymbolMap) > 0)
+   {
+      string pairs[];
+      int n = StringSplit(InpSymbolMap, ',', pairs);
+      for(int i = 0; i < n; i++)
+      {
+         string pair = pairs[i];
+         StringTrimLeft(pair);
+         StringTrimRight(pair);
+         if(StringLen(pair) == 0) continue;
+
+         string kv[];
+         if(StringSplit(pair, '=', kv) != 2) continue;
+         StringTrimLeft(kv[0]); StringTrimRight(kv[0]);
+         StringTrimLeft(kv[1]); StringTrimRight(kv[1]);
+
+         if(StringCompare(kv[0], src, false) == 0)
+            return kv[1];
+      }
+   }
+
+   // 2) globaler Suffix (nur anhängen, falls nicht bereits enthalten)
+   if(StringLen(InpSymbolSuffix) > 0 && StringFind(src, InpSymbolSuffix) < 0)
+      return src + InpSymbolSuffix;
+
+   // 3) unverändert
+   return src;
 }
