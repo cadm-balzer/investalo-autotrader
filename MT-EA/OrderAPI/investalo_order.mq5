@@ -24,6 +24,7 @@ input int      InpPollingInterval= 200;                             // Polling I
 input group "--- RISK Engine ---"
 input double   InpRiskPercent    = 0.5;                             // Risiko pro Trade (%) vom Kontostand
 input double   InpMaxLotSize     = 10.0;                            // Maximal erlaubte Lot-Größe
+input int      InpPartialClosePct= 50;                             // Teilschließung Fallback (%) wenn Signal kein qty_pct liefert
 
 input group "--- SYMBOL MAPPING (TradingView -> Broker) ---"
 // Format: "TV1=BROKER1,TV2=BROKER2"  (z.B. "US500=US500.cash,NAS100=NAS100.cash,GER40=DE40.cash")
@@ -122,13 +123,14 @@ void FetchAndExecuteSignals()
       double tp1       = signal["payload"]["tp1"].ToDbl();
       double tp2       = signal["payload"]["tp2"].ToDbl();
       int    qtyPct    = (int)signal["payload"]["qty_pct"].ToInt();
+      bool   beFlag    = signal["payload"]["breakeven"].ToBool();
       
       if(symbol != tvSymbol)
          PrintFormat("Symbol-Mapping: %s -> %s", tvSymbol, symbol);
       Print("Signal empfangen! ID: ", signalId, " | Action: ", action, " | Asset: ", symbol);
       
       // Signal an die Order-Execution übergeben
-      bool success = ProcessTrade(action, symbol, price, sl, tp1, tp2, qtyPct);
+      bool success = ProcessTrade(action, symbol, price, sl, tp1, tp2, qtyPct, beFlag);
       
       // Quittung (Ack) an API senden
       SendAcknowledgment(signalId, success);
@@ -138,7 +140,7 @@ void FetchAndExecuteSignals()
 //+------------------------------------------------------------------+
 //| Berechnet das Risiko und führt die Order über CTrade aus         |
 //+------------------------------------------------------------------+
-bool ProcessTrade(string action, string symbol, double price, double sl, double tp1, double tp2, int qtyPct)
+bool ProcessTrade(string action, string symbol, double price, double sl, double tp1, double tp2, int qtyPct, bool breakeven)
 {
    // Prüfen, ob das Asset im Market Watch Fenster existiert und geladen ist
    if(!SymbolInfoInteger(symbol, SYMBOL_SELECT))
@@ -159,6 +161,15 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
    if(action == "BREAKEVEN")
    {
       return MoveToBreakeven(symbol);
+   }
+
+   if(action == "PARTIAL_CLOSE")
+   {
+      // qty_pct aus dem Signal nutzen (1..99), sonst Fallback aus dem Input
+      int pct = (qtyPct >= 1 && qtyPct <= 99) ? qtyPct : (int)InpPartialClosePct;
+      bool ok = PartialClosePositions(symbol, pct);
+      if(ok && breakeven) MoveToBreakeven(symbol);
+      return ok;
    }
 
    // 2. NEUE TRADES (Market & Limit)
@@ -256,6 +267,54 @@ bool CloseAllPositionsForSymbol(string symbol)
       }
    }
    return allClosed;
+}
+
+//+------------------------------------------------------------------+
+//| Schließt einen prozentualen Anteil aller Positionen des Symbols  |
+//| pct = 1..99. Volumen wird auf Lot-Step abgerundet; würde der Rest |
+//| unter MinLot fallen, wird die Position komplett geschlossen.     |
+//+------------------------------------------------------------------+
+bool PartialClosePositions(string symbol, int pct)
+{
+   if(pct < 1)  pct = 1;
+   if(pct > 99) pct = 99;
+
+   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   if(step <= 0) step = 0.01;
+
+   bool allOk = true;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != symbol) continue;
+
+      ulong  ticket = PositionGetInteger(POSITION_TICKET);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+
+      // Zu schließendes Volumen auf den Lot-Step abrunden
+      double closeVol = MathFloor((volume * pct / 100.0) / step) * step;
+
+      // Verbleibender Rest unter MinLot -> Position komplett schließen
+      if(volume - closeVol < minVol) closeVol = volume;
+
+      if(closeVol < minVol)
+      {
+         Print("Teilschließung übersprungen (Volumen < MinLot) Ticket ", ticket);
+         continue;
+      }
+
+      bool ok = (closeVol >= volume) ? trade.PositionClose(ticket)
+                                     : trade.PositionClosePartial(ticket, closeVol);
+      if(ok)
+         Print("Teilschließung OK: ", DoubleToString(closeVol, 2), " von ",
+               DoubleToString(volume, 2), " Lot (Ticket ", ticket, ", ", pct, "%)");
+      else
+      {
+         allOk = false;
+         Print("Teilschließung fehlgeschlagen Ticket ", ticket);
+      }
+   }
+   return allOk;
 }
 
 //+------------------------------------------------------------------+

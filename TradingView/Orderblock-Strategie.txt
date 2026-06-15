@@ -1,0 +1,276 @@
+//@version=5
+strategy("Orderblock Multi-HTF Reversal Pro v3.5 (Shield & Strike) Automated", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, max_boxes_count=500, max_lines_count=500)
+
+// =========================================================================
+// 1. INPUTS & RISIKOMANAGEMENT
+// =========================================================================
+riskPct           = input.float(0.25, "Risiko pro Trade (%)", step=0.05, minval=0.01, maxval=5.0)
+tp1Ratio          = input.float(1.0, "TP1 / Teilschließung Ziel-CRV", tooltip="CRV-Level für Teilschließung + optionales Breakeven (1.0 = 1:1)")
+tp1QtyPct         = int(str.tonumber(input.string("50", "Teilschließung Menge (%)", options=["25", "50", "75"])))
+tp2Ratio          = input.float(3.0, "TP 2 Final-CRV (Restposition)")
+moveSLToBE        = input.bool(true, "SL auf Breakeven bei Teilschließung")
+
+// --- SESSION & FTMO WEEKEND CLOSE ---
+useSessionFilter  = input.bool(true, "Session-Filter aktivieren (Kill Zones)")
+tradeSession      = input.string("0800-1800:23456", "Handelszeit (Session)", tooltip="Format: HHMM-HHMM:Tage (23456 = Mo-Fr)")
+useFtmoFridayClose= input.bool(true, "FTMO Freitags-Close erzwingen", tooltip="Schließt alle Positionen vor dem Wochenende")
+fridayHour        = input.int(21, "Freitag Schließung: Stunde (24h)", minval=0, maxval=23)
+fridayMinute      = input.int(30, "Freitag Schließung: Minute", minval=0, maxval=59)
+
+// --- ADX TRENDSTÄRKE-FILTER ---
+useAdxFilter      = input.bool(true, "ADX Stärke-Filter aktivieren", tooltip="Blockiert Trades bei zu extremen HTF-Trends")
+adxLength         = input.int(14, "ADX Periode")
+adxThreshold      = input.float(30.0, "Max. erlaubter ADX-Wert", step=1.0, tooltip="Über diesem Wert ist der Trend zu stark für Gegen-Trades")
+
+// --- ALGORITHMISCHER CIRCUIT BREAKER ---
+useCircuitBreaker = input.bool(true, "Tages-Circuit-Breaker aktivieren")
+maxDailyLosses    = input.int(2, "Max. erlaubte Verlust-Trades pro Tag")
+maxDailyLossPct   = input.float(0.5, "Max. Tagesverlust vom Startkapital (%)", step=0.1)
+
+// --- Alpha-Filter v3.4 ---
+useTrendFilter    = input.bool(true, "HTF Trend-Filter aktivieren (EMA)")
+trendTimeframe    = input.timeframe("60", "HTF Trend Zeitrahmen (z.B. 60=H1)")
+trendEmaLen       = input.int(200, "HTF Trend EMA Periode")
+
+useMinSizeFilter  = input.bool(true, "Mikro-Zonen filtern (ATR-Schutz)")
+minBoxAtrFactor   = input.float(0.4, "Min. Box-Größe (x M15-ATR)", step=0.1)
+
+// --- Core Inputs ---
+useVolumeFilter   = input.bool(true, "Displacement durch Volumen bestätigen")
+volMaLength       = input.int(20, "Volumen-SMA Periode")
+volMultiplier     = input.float(1.1, "Volumen-Multiplikator (x SMA)")
+entryType         = input.string("Limit 50% Mean", "Einstiegs-Logik", options=["Market", "Limit Box-Kante", "Limit 50% Mean"])
+slBufferTicks     = input.int(10, "SL Buffer (in Ticks)")
+orderExpiry       = input.int(25, "Setup Gültigkeit (Bars)")
+cooldownBars      = input.int(5, "Signal-Cooldown (Bars)")
+
+// --- Marktstruktur M15 ---
+locLeftLen        = input.int(3, "Lokal: Pivot Links")
+locRightLen       = input.int(3, "Lokal: Pivot Rechts")
+colorBearC        = input.color(color.new(color.red, 90), "Lokaler Bearish OB")
+colorBullC        = input.color(color.new(color.green, 90), "Lokaler Bullish OB")
+atrLength         = input.int(14, "ATR Periode")
+displacementMult  = input.float(1.2, "Displacement Multiplikator")
+
+var box[] cBearBoxes = array.new_box(), var line[] cBearLines = array.new_line()
+var box[] cBullBoxes = array.new_box(), var line[] cBullLines = array.new_line()
+var bool longSetupActive = false, var float targetLongEntry = na, var float targetLongSL = na, var int longSetupBar = 0
+var bool shortSetupActive = false, var float targetShortEntry = na, var float targetShortSL = na, var int shortSetupBar = 0
+var int lastTradeTriggerBar = 0
+var float longQty = na, var float shortQty = na, var float dynamicSL = na, var bool tp1Hit = false
+
+// =========================================================================
+// 2. KERN-BERECHNUNGEN & FILTER-LOGIK
+// =========================================================================
+f_adx(len) =>
+    [_, _, adxValue] = ta.dmi(len, len)
+    adxValue
+
+htfEma = request.security(syminfo.tickerid, trendTimeframe, ta.ema(close, trendEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfAdx = request.security(syminfo.tickerid, trendTimeframe, f_adx(adxLength), barmerge.gaps_off, barmerge.lookahead_off)
+
+trendLongAllowed  = useTrendFilter ? (close > htfEma) : true
+trendShortAllowed = useTrendFilter ? (close < htfEma) : true
+adxAllowed        = useAdxFilter ? (htfAdx < adxThreshold) : true
+
+inSession = useSessionFilter ? not na(time(timeframe.period, tradeSession)) : true
+
+var float dayStartEquity = na
+if ta.change(time("D")) != 0 or na(dayStartEquity)
+    dayStartEquity := strategy.equity
+
+f_count_daily_losses() =>
+    int losses = 0
+    if strategy.closedtrades > 0
+        for i = strategy.closedtrades - 1 to 0
+            if strategy.closedtrades.exit_time(i) >= time("D")
+                if strategy.closedtrades.profit(i) < 0
+                    losses := losses + 1
+            else
+                break
+    losses
+
+currentDailyLoss    = dayStartEquity - strategy.equity
+maxDailyLossAmt     = dayStartEquity * (maxDailyLossPct / 100.0)
+dailyLossesCount    = f_count_daily_losses()
+circuitBreakerHit   = useCircuitBreaker and (currentDailyLoss >= maxDailyLossAmt or dailyLossesCount >= maxDailyLosses)
+
+m15Atr = ta.atr(atrLength)
+volMa = ta.sma(volume, volMaLength)
+volConfirmed = useVolumeFilter ? (volume > volMa * volMultiplier) : true
+
+f_calc_htf_obs(lLen, rLen, aLen, dMult) =>
+    ph = ta.pivothigh(high, lLen, rLen), pl = ta.pivotlow(low, lLen, rLen)
+    atrVal = ta.atr(aLen)
+    float bTop = na, float bBot = na, int bOff = na
+    if not na(ph) and (low[rLen] - ta.lowest(low, rLen)) >= (atrVal[rLen] * dMult)
+        bTop := high[rLen], bBot := low[rLen], bOff := rLen
+    float buTop = na, float buBot = na, int buOff = na
+    if not na(pl) and (ta.highest(high, rLen) - high[rLen]) >= (atrVal[rLen] * dMult)
+        buTop := high[rLen], buBot := low[rLen], buOff := rLen
+    [bTop, bBot, bOff, buTop, buBot, buOff]
+
+[cBTop, cBBot, cBOff, cBlTop, cBlBot, cBlOff] = f_calc_htf_obs(locLeftLen, locRightLen, atrLength, displacementMult)
+
+bool longBoxValid  = not na(cBlTop) ? (useMinSizeFilter ? (cBlTop - cBlBot >= m15Atr * minBoxAtrFactor) : true) : false
+bool shortBoxValid = not na(cBTop) ? (useMinSizeFilter ? (cBTop - cBBot >= m15Atr * minBoxAtrFactor) : true) : false
+
+f_manage_local_zones(bTop, bBottom, bOff, buTop, buBottom, buOff, bBoxes, bLines, buBoxes, buLines, cBear, cBull) =>
+    if not na(bTop) and not na(bOff)
+        int startBar = bar_index - bOff
+        array.push(bBoxes, box.new(left=startBar, top=bTop, right=bar_index, bottom=bBottom, bgcolor=cBear, border_color=color.new(cBear, 40)))
+        array.push(bLines, line.new(x1=startBar, y1=(bTop + bBottom) / 2.0, x2=bar_index, y2=(bTop + bBottom) / 2.0, color=color.new(cBear, 30), style=line.style_dashed))
+    if array.size(bBoxes) > 0
+        for i = array.size(bBoxes) - 1 to 0
+            box cb = array.get(bBoxes, i)
+            line cl = array.get(bLines, i)
+            if high > box.get_top(cb) or high < box.get_bottom(cb)
+                box.delete(cb)
+                line.delete(cl)
+                array.remove(bBoxes, i)
+                array.remove(bLines, i)
+                0
+            else
+                box.set_right(cb, bar_index)
+                line.set_x2(cl, bar_index)
+                0
+                
+    if not na(buTop) and not na(buOff)
+        int startBar = bar_index - buOff
+        array.push(buBoxes, box.new(left=startBar, top=buTop, right=bar_index, bottom=buBottom, bgcolor=cBull, border_color=color.new(cBull, 40)))
+        array.push(buLines, line.new(x1=startBar, y1=(buTop + buBottom) / 2.0, x2=bar_index, y2=(buTop + buBottom) / 2.0, color=color.new(cBull, 30), style=line.style_dashed))
+    if array.size(buBoxes) > 0
+        for i = array.size(buBoxes) - 1 to 0
+            box cb = array.get(buBoxes, i)
+            line cl = array.get(buLines, i)
+            if low < box.get_bottom(cb) or low > box.get_top(cb)
+                box.delete(cb)
+                line.delete(cl)
+                array.remove(buBoxes, i)
+                array.remove(buLines, i)
+                0
+            else
+                box.set_right(cb, bar_index)
+                line.set_x2(cl, bar_index)
+                0
+    0
+
+f_manage_local_zones(cBTop, cBBot, cBOff, cBlTop, cBlBot, cBlOff, cBearBoxes, cBearLines, cBullBoxes, cBullLines, colorBearC, colorBullC)
+
+bool cooldownOver = (bar_index - lastTradeTriggerBar) >= cooldownBars
+bool buySignal   = not na(cBlTop) and cooldownOver and volConfirmed and trendLongAllowed and longBoxValid and inSession and adxAllowed and not circuitBreakerHit
+bool sellSignal  = not na(cBTop) and cooldownOver and volConfirmed and trendShortAllowed and shortBoxValid and inSession and adxAllowed and not circuitBreakerHit
+
+// =========================================================================
+// 3. POSITIONS- & RISK-ENGINE
+// =========================================================================
+if strategy.position_size == 0
+    tp1Hit    := false
+    dynamicSL := na
+
+if circuitBreakerHit
+    longSetupActive  := false
+    shortSetupActive := false
+    strategy.cancel_all()
+
+if buySignal and strategy.position_size == 0
+    float rawSL = cBlBot - (slBufferTicks * syminfo.mintick)
+    float rawEntry = entryType == "Limit Box-Kante" ? cBlTop : (entryType == "Limit 50% Mean" ? (cBlTop + cBlBot) / 2.0 : close)
+    if close > rawEntry
+        targetLongSL := rawSL, targetLongEntry := rawEntry
+        float riskAmount = strategy.equity * (riskPct / 100.0)
+        float riskDist   = math.abs(rawEntry - rawSL)
+        longQty := riskDist > 0 ? riskAmount / (riskDist * syminfo.pointvalue) : na
+        longSetupActive := true, longSetupBar := bar_index, lastTradeTriggerBar := bar_index
+
+if longSetupActive and (strategy.position_size > 0 or low < targetLongSL or (bar_index - longSetupBar) > orderExpiry)
+    longSetupActive := false
+
+if sellSignal and strategy.position_size == 0
+    float rawSL = cBTop + (slBufferTicks * syminfo.mintick)
+    float rawEntry = entryType == "Limit Box-Kante" ? cBBot : (entryType == "Limit 50% Mean" ? (cBTop + cBBot) / 2.0 : close)
+    if close < rawEntry
+        targetShortSL := rawSL, targetShortEntry := rawEntry
+        float riskAmount = strategy.equity * (riskPct / 100.0)
+        float riskDist   = math.abs(rawSL - rawEntry)
+        shortQty := riskDist > 0 ? riskAmount / (riskDist * syminfo.pointvalue) : na
+        shortSetupActive := true, shortSetupBar := bar_index, lastTradeTriggerBar := bar_index
+
+if shortSetupActive and (strategy.position_size < 0 or high > targetShortSL or (bar_index - shortSetupBar) > orderExpiry)
+    shortSetupActive := false
+
+// =========================================================================
+// 4. EXITS & AUTOMATED LIFECYCLE ALERTS (KORRIGIERT & ENT澤MPFT)
+// =========================================================================
+string alert_close_all = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+string alert_partial   = '{"action": "PARTIAL_CLOSE", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "qty_pct": ' + str.tostring(tp1QtyPct) + ', "breakeven": ' + (moveSLToBE ? "true" : "false") + '}'
+
+if strategy.position_size > 0
+    if na(dynamicSL)
+        dynamicSL := targetLongSL
+    float entryPrice = strategy.position_avg_price
+    float riskDist   = entryPrice - targetLongSL
+    float targetTP1  = entryPrice + (riskDist * tp1Ratio)
+    
+    // Check TP1-Zustand
+    if not tp1Hit and high >= targetTP1
+        tp1Hit := true
+        if moveSLToBE
+            dynamicSL := entryPrice
+            
+    // State-Machine basierte Orderplatzierung
+    if not tp1Hit
+        strategy.exit("TP1 Long", "Long OB", qty_percent=tp1QtyPct, limit=targetTP1, stop=dynamicSL, alert_message=alert_partial)
+        strategy.exit("TP2 Long", "Long OB", qty_percent=100, limit=entryPrice + (riskDist * tp2Ratio), stop=dynamicSL, alert_message=alert_close_all)
+    else
+        strategy.exit("TP2 Long", "Long OB", qty_percent=100, limit=entryPrice + (riskDist * tp2Ratio), stop=dynamicSL, alert_message=alert_close_all)
+        strategy.cancel("TP1 Long")
+
+if strategy.position_size < 0
+    if na(dynamicSL)
+        dynamicSL := targetShortSL
+    float entryPrice = strategy.position_avg_price
+    float riskDist   = targetShortSL - entryPrice
+    float targetTP1  = entryPrice - (riskDist * tp1Ratio)
+    
+    // Check TP1-Zustand
+    if not tp1Hit and low <= targetTP1
+        tp1Hit := true
+        if moveSLToBE
+            dynamicSL := entryPrice
+            
+    // State-Machine basierte Orderplatzierung
+    if not tp1Hit
+        strategy.exit("TP1 Short", "Short OB", qty_percent=tp1QtyPct, limit=targetTP1, stop=dynamicSL, alert_message=alert_partial)
+        strategy.exit("TP2 Short", "Short OB", qty_percent=100, limit=entryPrice - (riskDist * tp2Ratio), stop=dynamicSL, alert_message=alert_close_all)
+    else
+        strategy.exit("TP2 Short", "Short OB", qty_percent=100, limit=entryPrice - (riskDist * tp2Ratio), stop=dynamicSL, alert_message=alert_close_all)
+        strategy.cancel("TP1 Short")
+
+// =========================================================================
+// 5. ORDER PLACEMENT WITH DYNAMIC PAYLOADS
+// =========================================================================
+if longSetupActive and strategy.position_size == 0 and not na(longQty) and not circuitBreakerHit
+    float expected_tp = targetLongEntry + (math.abs(targetLongEntry - targetLongSL) * tp2Ratio)
+    string alert_buy = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(targetLongEntry) + ', "sl": ' + str.tostring(targetLongSL) + ', "tp1": ' + str.tostring(expected_tp) + ', "qty_pct": 100}'
+    strategy.entry("Long OB", strategy.long, limit=targetLongEntry, qty=longQty, alert_message=alert_buy)
+else if strategy.position_size == 0
+    strategy.cancel("Long OB")
+
+if shortSetupActive and strategy.position_size == 0 and not na(shortQty) and not circuitBreakerHit
+    float expected_tp = targetShortEntry - (math.abs(targetShortSL - targetShortEntry) * tp2Ratio)
+    string alert_sell = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(targetShortEntry) + ', "sl": ' + str.tostring(targetShortSL) + ', "tp1": ' + str.tostring(expected_tp) + ', "qty_pct": 100}'
+    strategy.entry("Short OB", strategy.short, limit=targetShortEntry, qty=shortQty, alert_message=alert_sell)
+else if strategy.position_size == 0
+    strategy.cancel("Short OB")
+
+// --- HARD EXITS FÜR FTMO (FREITAGS-CLOSE) ---
+isFridayClose = useFtmoFridayClose and dayofweek == dayofweek.friday and (hour > fridayHour or (hour == fridayHour and minute >= fridayMinute))
+if isFridayClose
+    strategy.close_all("FTMO Weekend Close", alert_message=alert_close_all)
+    strategy.cancel_all()
+    longSetupActive  := false
+    shortSetupActive := false
+
+// Plots
+plot(useTrendFilter ? htfEma : na, color=color.orange, linewidth=2, title="HTF Trend Filter (EMA)")

@@ -72,6 +72,7 @@ class WebhookPayload(BaseModel):
     tp1: float | None = Field(default=None, gt=0)
     tp2: float | None = Field(default=None, gt=0)
     qty_pct: int = Field(default=100, ge=1, le=100)
+    breakeven: bool = False  # SL nach Teilschließung auf Breakeven ziehen (PARTIAL_CLOSE)
 
     @field_validator("symbol")
     @classmethod
