@@ -1,0 +1,114 @@
+//@version=5
+strategy("Gold Pulse M5 Scalper", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// ==========================================
+// INPUTS & PARAMETER
+// ==========================================
+
+// Gleitende Durchschnitte (EMAs)
+emaFastLen   = input.int(13, title="Fast EMA Length", group="Moving Averages")
+emaMediumLen = input.int(50, title="Medium EMA Length", group="Moving Averages")
+emaSlowLen   = input.int(200, title="Slow EMA (Trend Filter)", group="Moving Averages")
+
+// Stochastic Oscillator
+stochLen     = input.int(14, title="Stoch Length", group="Stochastic")
+stochK       = input.int(3, title="Stoch %K Smoothing", group="Stochastic")
+stochD       = input.int(3, title="Stoch %D Smoothing", group="Stochastic")
+stochLower   = input.int(20, title="Stoch Lower Level (Oversold)", group="Stochastic")
+stochUpper   = input.int(80, title="Stoch Upper Level (Overbought)", group="Stochastic")
+
+// Risk-Management (ATR Exits)
+atrLen       = input.int(14, title="ATR Length", group="Risk Management")
+atrMultSL    = input.float(1.5, title="SL Multiplier (ATR)", group="Risk Management")
+atrMultTP    = input.float(2.5, title="TP Multiplier (ATR)", group="Risk Management")
+
+// Zeitfilter (Session)
+useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter")
+sessionTime  = input.session("0800-2100:23456", title="Allowed Session (UTC/Broker-Zeit)", group="Time Filter")
+
+// ==========================================
+// INDIKATOREN BERECHNUNG
+// ==========================================
+
+ema13  = ta.ema(close, emaFastLen)
+ema50  = ta.ema(close, emaMediumLen)
+ema200 = ta.ema(close, emaSlowLen)
+
+// Standard Stochastic Berechnung
+stochRaw = ta.stoch(close, high, low, stochLen)
+k = ta.sma(stochRaw, stochK)
+d = ta.sma(k, stochD)
+
+// ATR für dynamischen SL/TP
+atr = ta.atr(atrLen)
+
+// Überprüfung des Zeitfensters
+isInSession = not useSession or not na(time(timeframe.period, sessionTime))
+
+// ==========================================
+// TRADING LOGIK & STRATEGIE-BEDINGUNGEN
+// ==========================================
+
+// --- LONG BEDINGUNGEN ---
+trendLong       = close > ema200
+momentumLong    = ema13 > ema50
+// Pullback: Tief der aktuellen ODER der vorherigen Kerze war in der Zone zwischen EMA13 und EMA50
+pullbackLong    = (low <= ema13 and low >= ema50) or (low[1] <= ema13[1] and low[1] >= ema50[1])
+triggerLong     = ta.crossover(k, d) and k < stochLower
+longCondition   = trendLong and momentumLong and pullbackLong and triggerLong and isInSession
+
+// --- SHORT BEDINGUNGEN ---
+trendShort      = close < ema200
+momentumShort   = ema13 < ema50
+// Pullback: Hoch der aktuellen ODER der vorherigen Kerze war in der Zone zwischen EMA13 und EMA50
+pullbackShort   = (high >= ema13 and high <= ema50) or (high[1] >= ema13[1] and high[1] <= ema50[1])
+triggerShort    = ta.crossunder(k, d) and k > stochUpper
+shortCondition  = trendShort and momentumShort and pullbackShort and triggerShort and isInSession
+
+// ==========================================
+// EXECUTION & RISK MANAGEMENT
+// ==========================================
+
+// Statische Variablen, um den SL und TP beim Einstieg einzufrieren
+var float stopLevel = na
+var float profitLevel = na
+
+// API-Alerts (JSON) für Investalo Gateway
+string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+
+// Wenn keine Position offen ist, Levels zurücksetzen
+if strategy.position_size == 0
+    stopLevel := na
+    profitLevel := na
+
+// Long Einstieg & Exit-Berechnung
+if longCondition and strategy.position_size == 0
+    stopLevel := close - (atrMultSL * atr)
+    profitLevel := close + (atrMultTP * atr)
+    string alertBuy = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(stopLevel) + ', "tp1": ' + str.tostring(profitLevel) + ', "qty_pct": 100}'
+    strategy.entry("GoldPulse_Long", strategy.long, alert_message=alertBuy)
+
+// Short Einstieg & Exit-Berechnung
+if shortCondition and strategy.position_size == 0
+    stopLevel := close + (atrMultSL * atr)
+    profitLevel := close - (atrMultTP * atr)
+    string alertSell = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(stopLevel) + ', "tp1": ' + str.tostring(profitLevel) + ', "qty_pct": 100}'
+    strategy.entry("GoldPulse_Short", strategy.short, alert_message=alertSell)
+
+// Exits ausführen
+if strategy.position_size > 0
+    strategy.exit("Exit_Long", "GoldPulse_Long", stop=stopLevel, limit=profitLevel, alert_message=alertCloseAll)
+
+if strategy.position_size < 0
+    strategy.exit("Exit_Short", "GoldPulse_Short", stop=stopLevel, limit=profitLevel, alert_message=alertCloseAll)
+
+// ==========================================
+// VISUALISIERUNG AUF DEM CHART
+// ==========================================
+
+plot(ema13, color=color.blue, title="EMA 13", linewidth=1)
+plot(ema50, color=color.orange, title="EMA 50", linewidth=1)
+plot(ema200, color=color.red, title="EMA 200 (Trend Filter)", linewidth=2)
+
+// Hintergrundfarbe während der erlaubten Trading-Session einfärben
+bgcolor(isInSession and useSession ? color.new(color.green, 96) : na)

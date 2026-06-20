@@ -78,8 +78,11 @@ class WebhookPayload(BaseModel):
     @classmethod
     def _upper_symbol(cls, v: str) -> str:
         v = v.upper()
-        if not v.isalnum():
-            raise ValueError("symbol must be alphanumeric")
+        # Erlaubt Buchstaben, Ziffern, Punkt und Bindestrich
+        # (z.B. BTCUSDT.P, US500.cash, EUR-USD)
+        allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
+        if not all(c in allowed for c in v):
+            raise ValueError("symbol must be alphanumeric and may contain '.' or '-'")
         return v
 
 

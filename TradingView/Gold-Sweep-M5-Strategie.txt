@@ -1,0 +1,113 @@
+//@version=5
+strategy("Session Liquidity Sweep - M5/M30", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// ==========================================
+// INPUTS & PARAMETER
+// ==========================================
+
+// Session-Zeiten (WICHTIG: Im Format der Exchange-Zeitzone eingeben!)
+// Für XAUUSD bei den meisten Brokern (UTC+2 / UTC+3): 
+// Pre-Session (Range-Aufbau): z.B. 13:30 bis 15:30 Uhr
+// Trade-Session (Ausbruch): z.B. 15:30 bis 18:00 Uhr
+rangeSession = input.session("1330-1530", title="Pre-Session (Range Aufbau)", group="Zeitzonen")
+tradeSession = input.session("1530-1800", title="Trade-Session (Sweep Phase)", group="Zeitzonen")
+
+// Risiko & Puffer
+slBufferPips = input.float(10.0, title="SL Buffer (in Pips)", group="Risk Management") / 10 // Puffer in Punkten
+minSweepSize = input.float(2.0, title="Min. Ausbruch in Punkten (Filter)", group="Risk Management")
+slCrv          = input.float(1.0, title="SL CRV-Multiplikator", group="Risk Management", minval=0.1, step=0.1)
+tpCrv          = input.float(1.0, title="TP CRV-Multiplikator", group="Risk Management", minval=0.1, step=0.1)
+
+// ==========================================
+// SESSION & RANGE LOGIK
+// ==========================================
+
+inRangeSession = not na(time(timeframe.period, rangeSession))
+inTradeSession = not na(time(timeframe.period, tradeSession))
+
+var float rangeHigh = na
+var float rangeLow = na
+
+// Range aufbauen und High/Low speichern
+if inRangeSession
+    if not inRangeSession[1] // Start der Session
+        rangeHigh := high
+        rangeLow := low
+    else
+        rangeHigh := math.max(rangeHigh, high)
+        rangeLow := math.min(rangeLow, low)
+
+// Nach der Trade-Session die Range zurücksetzen (Visualisierung aufräumen)
+if not inTradeSession and not inRangeSession
+    rangeHigh := na
+    rangeLow := na
+
+// ==========================================
+// SWEEP LOGIK & TRIGGER
+// ==========================================
+
+// Ein "Sweep Short" passiert, wenn der Kurs in der Trade-Session über das Range-High ausbricht, 
+// aber die Kerze *unter* dem Range-High schließt.
+sweepShortTrigger = inTradeSession and high > (rangeHigh + minSweepSize) and close < rangeHigh
+
+// Ein "Sweep Long" passiert, wenn der Kurs unter das Range-Low ausbricht, 
+// aber die Kerze *über* dem Range-Low schließt.
+sweepLongTrigger = inTradeSession and low < (rangeLow - minSweepSize) and close > rangeLow
+
+// ==========================================
+// EXECUTION & WEBHOOK PAYLOAD
+// ==========================================
+
+var float slLevel = na
+var float tpLevel = na
+var float entryLevel = na
+
+string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+
+if strategy.position_size == 0
+    slLevel := na
+    tpLevel := na
+    entryLevel := na
+
+// --- SHORT ENTRY (Fakeout am Hoch) ---
+if sweepShortTrigger and strategy.position_size == 0
+    entryLevel := close
+    float riskDistShort = math.abs((high + slBufferPips) - entryLevel)
+    slLevel := entryLevel + (riskDistShort * slCrv)   // SL via CRV-Multiplikator
+    tpLevel := entryLevel - (riskDistShort * tpCrv)   // TP via CRV-Multiplikator
+    
+    msgShortEntry = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slLevel) + ', "tp1": ' + str.tostring(tpLevel) + ', "qty_pct": 100}'
+    strategy.entry("Sweep_Short", strategy.short, alert_message=msgShortEntry)
+
+// --- LONG ENTRY (Fakeout am Tief) ---
+if sweepLongTrigger and strategy.position_size == 0
+    entryLevel := close
+    float riskDistLong = math.abs(entryLevel - (low - slBufferPips))
+    slLevel := entryLevel - (riskDistLong * slCrv)    // SL via CRV-Multiplikator
+    tpLevel := entryLevel + (riskDistLong * tpCrv)    // TP via CRV-Multiplikator
+    
+    msgLongEntry = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slLevel) + ', "tp1": ' + str.tostring(tpLevel) + ', "qty_pct": 100}'
+    strategy.entry("Sweep_Long", strategy.long, alert_message=msgLongEntry)
+
+// --- EXITS ---
+if strategy.position_size > 0
+    if not na(entryLevel)
+        strategy.exit("Exit_Long", "Sweep_Long", stop=slLevel, limit=tpLevel, alert_message=alertCloseAll)
+
+if strategy.position_size < 0
+    if not na(entryLevel)
+        strategy.exit("Exit_Short", "Sweep_Short", stop=slLevel, limit=tpLevel, alert_message=alertCloseAll)
+
+// ==========================================
+// VISUALISIERUNG AUF DEM CHART
+// ==========================================
+
+// Hintergrund für die Vorbereitungs-Session (Grau)
+bgcolor(inRangeSession ? color.new(color.gray, 90) : na, title="Range Session")
+
+// Hintergrund für die heiße Phase (Gelb/Orange)
+bgcolor(inTradeSession ? color.new(color.orange, 90) : na, title="Trade Session")
+
+// Linien für das High und Low der Range zeichnen
+plot(inTradeSession or inRangeSession ? rangeHigh : na, color=color.red, style=plot.style_linebr, linewidth=2, title="Range High")
+plot(inTradeSession or inRangeSession ? rangeLow : na, color=color.green, style=plot.style_linebr, linewidth=2, title="Range Low")
