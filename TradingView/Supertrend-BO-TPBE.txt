@@ -1,0 +1,120 @@
+//@version=5
+strategy("Supertrend Direct Breakout - CRV Opt", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// ==========================================
+// INPUTS & PARAMETER
+// ==========================================
+
+stFactor     = input.float(3.0, title="Supertrend Factor", group="Supertrend")
+stPeriod     = input.int(10, title="Supertrend Period", group="Supertrend")
+
+// Zwei Gewinnziele für ein mathematisch sicheres Bestehen der Challenge
+rewardRatio1 = input.float(1.0, title="Risk/Reward TP1 (Teilverkauf)", group="Risk Management")
+rewardRatio2 = input.float(3.0, title="Risk/Reward TP2 (Endziel)", group="Risk Management")
+slBuffer     = input.float(5.0, title="SL Buffer (in Points/Pips)", group="Risk Management") / 10
+partialQtyPct = input.int(50, title="TP1 Teilverkauf (%)", options=[25, 50, 75], group="Risk Management")
+moveToBreakeven = input.bool(true, title="Nach TP1 Stop auf Breakeven", group="Risk Management")
+
+useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter")
+sessionTime  = input.session("0800-2100:23456", title="Allowed Trading Session", group="Time Filter")
+
+// ==========================================
+// INDIKATOR BERECHNUNG
+// ==========================================
+
+[supertrend, direction] = ta.supertrend(stFactor, stPeriod)
+
+isInSession = not useSession or not na(time(timeframe.period, sessionTime))
+
+trendFlipToLong  = (direction == -1 and direction[1] == 1)
+trendFlipToShort = (direction == 1 and direction[1] == -1)
+
+longCondition  = isInSession and trendFlipToLong
+shortCondition = isInSession and trendFlipToShort
+
+// ==========================================
+// LEVEL SPEICHERUNG & BREAK-EVEN LOGIK
+// ==========================================
+
+var float entryPriceLevel = na
+var float slPriceLevel = na
+var float tp1PriceLevel = na
+var float tp2PriceLevel = na
+var bool tp1Hit = false
+
+if strategy.position_size == 0
+    entryPriceLevel := na
+    slPriceLevel    := na
+    tp1PriceLevel   := na
+    tp2PriceLevel   := na
+    tp1Hit          := false
+
+// ==========================================
+// EXECUTION & WEBHOOK PAYLOADS
+// ==========================================
+
+// --- LONG ENTRY ---
+if longCondition and strategy.position_size == 0
+    slPriceLevel    := supertrend - slBuffer
+    entryPriceLevel := close
+    risk            = entryPriceLevel - slPriceLevel
+    tp1PriceLevel   := entryPriceLevel + (risk * rewardRatio1) // TP1 bei 1:1
+    tp2PriceLevel   := entryPriceLevel + (risk * rewardRatio2) // TP2 bei 1:3
+    
+    // Payload liefert beide TPs an deinen MT5 EA
+    msgLongEntry = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slPriceLevel) + ', "tp1": ' + str.tostring(tp1PriceLevel) + ', "tp2": ' + str.tostring(tp2PriceLevel) + ', "qty_pct": 100}'
+    strategy.entry("ST_Direct_Long", strategy.long, alert_message=msgLongEntry)
+
+// --- SHORT ENTRY ---
+if shortCondition and strategy.position_size == 0
+    slPriceLevel    := supertrend + slBuffer
+    entryPriceLevel := close
+    risk            = slPriceLevel - entryPriceLevel
+    tp1PriceLevel   := entryPriceLevel - (risk * rewardRatio1)
+    tp2PriceLevel   := entryPriceLevel - (risk * rewardRatio2)
+    
+    msgShortEntry = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slPriceLevel) + ', "tp1": ' + str.tostring(tp1PriceLevel) + ', "tp2": ' + str.tostring(tp2PriceLevel) + ', "qty_pct": 100}'
+    strategy.entry("ST_Direct_Short", strategy.short, alert_message=msgShortEntry)
+
+// --- TRAILING / BREAK-EVEN AKTIVIERUNG IM TESTER ---
+if strategy.position_size > 0
+    if high >= tp1PriceLevel
+        tp1Hit := true
+    if tp1Hit and moveToBreakeven
+        slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
+
+if strategy.position_size < 0
+    if low <= tp1PriceLevel
+        tp1Hit := true
+    if tp1Hit and moveToBreakeven
+        slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
+
+// --- EXITS PAYLOADS ---
+string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+string alertPartialClose = '{"action": "PARTIAL_CLOSE", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "qty_pct": ' + str.tostring(partialQtyPct) + ', "breakeven": ' + (moveToBreakeven ? "true" : "false") + '}'
+
+// Exits Long
+if strategy.position_size > 0
+    if not tp1Hit
+        strategy.exit("TP1_Long", "ST_Direct_Long", qty_percent=partialQtyPct, limit=tp1PriceLevel, stop=slPriceLevel, alert_message=alertPartialClose)
+    else
+        strategy.exit("TP2_Long", "ST_Direct_Long", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
+
+// Exits Short
+if strategy.position_size < 0
+    if not tp1Hit
+        strategy.exit("TP1_Short", "ST_Direct_Short", qty_percent=partialQtyPct, limit=tp1PriceLevel, stop=slPriceLevel, alert_message=alertPartialClose)
+    else
+        strategy.exit("TP2_Short", "ST_Direct_Short", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
+
+// ==========================================
+// VISUALISIERUNG
+// ==========================================
+
+plot(supertrend, color = (direction == -1) ? color.green : color.red, linewidth=2, title="Supertrend Line")
+
+// Dynamische Level-Linien während des Trades zeichnen
+plot(strategy.position_size != 0 ? entryPriceLevel : na, color=color.blue, style=plot.style_linebr, linewidth=2, title="Einstieg")
+plot(strategy.position_size != 0 ? slPriceLevel : na, color=color.red, style=plot.style_linebr, linewidth=1, title="Aktueller SL")
+plot(strategy.position_size != 0 ? tp1PriceLevel : na, color=color.orange, style=plot.style_linebr, linewidth=1, title="Teilziel TP1")
+plot(strategy.position_size != 0 ? tp2PriceLevel : na, color=color.green, style=plot.style_linebr, linewidth=1, title="Hauptziel TP2")

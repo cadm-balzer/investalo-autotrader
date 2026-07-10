@@ -1,0 +1,97 @@
+//@version=5
+strategy("Gold M1 Extreme Bollinger Scalper", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// ==========================================
+// INPUTS & PARAMETER
+// ==========================================
+
+// Bollinger Bänder (Höhere Standardabweichung für M1-Rauschfilter)
+bbLen        = input.int(20, title="BB Length", group="Bollinger Bands")
+bbMult       = input.float(2.5, title="BB StdDev Multiplier", group="Bollinger Bands")
+
+// ATR (Volatilitäts- & Impuls-Check)
+atrLen       = input.int(14, title="ATR Length", group="Volatility Filter")
+atrThreshold = input.float(1.5, title="Min. Candle Size (x ATR)", group="Volatility Filter", tooltip="Die Ausbruchskerze muss um diesen Faktor größer sein als der ATR-Schnitt")
+
+// Exit-Parameter (Schnelle Scalps für die Challenge)
+tpAtrMult    = input.float(1.0, title="Take Profit Multiplier (ATR)", group="Exits")
+slAtrMult    = input.float(1.2, title="Stop Loss Multiplier (ATR)", group="Exits")
+
+// Zeitfilter (Volatilitäts-Fenster: z.B. London + New York Session)
+useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter")
+sessionTime  = input.session("0800-2100:23456", title="Allowed Trading Session", group="Time Filter")
+
+// ==========================================
+// BERECHNUNGEN
+// ==========================================
+
+// Bollinger Bänder (Manuelle Berechnung für v5)
+bbBasis = ta.sma(close, bbLen)
+dev     = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + dev
+bbLower = bbBasis - dev
+
+// ATR & Kerzengröße (High - Low)
+atr = ta.atr(atrLen)
+candleSize = high - low
+
+// Bedingungen prüfen
+isInSession = not useSession or not na(time(timeframe.period, sessionTime))
+isImpulsive = candleSize > (atr * atrThreshold)
+
+// ==========================================
+// TRADING LOGIK (MEAN REVERSION ON M1)
+// ==========================================
+
+// LONG: Kurs schießt unter das untere Band + Kerze war extrem impulsiv
+longCondition = isInSession and isImpulsive and close < bbLower
+
+// SHORT: Kurs schießt über das obere Band + Kerze war extrem impulsiv
+shortCondition = isInSession and isImpulsive and close > bbUpper
+
+// ==========================================
+// EXECUTION & WEBHOOK PAYLOADS
+// ==========================================
+
+var float stopLevel = na
+var float profitLevel = na
+string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+
+if strategy.position_size == 0
+    stopLevel := na
+    profitLevel := na
+
+// --- LONG ENTRY ---
+if longCondition and strategy.position_size == 0
+    stopLevel := close - (slAtrMult * atr)
+    profitLevel := close + (tpAtrMult * atr) // Sehr schneller, mathematischer TP
+    
+    msgLongEntry = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(stopLevel) + ', "tp1": ' + str.tostring(profitLevel) + ', "qty_pct": 100}'
+    strategy.entry("BB_Scalp_Long", strategy.long, alert_message=msgLongEntry)
+
+// --- SHORT ENTRY ---
+if shortCondition and strategy.position_size == 0
+    stopLevel := close + (slAtrMult * atr)
+    profitLevel := close - (tpAtrMult * atr)
+    
+    msgShortEntry = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(stopLevel) + ', "tp1": ' + str.tostring(profitLevel) + ', "qty_pct": 100}'
+    strategy.entry("BB_Scalp_Short", strategy.short, alert_message=msgShortEntry)
+
+// --- EXITS ---
+if strategy.position_size > 0
+    strategy.exit("Exit_Long", "BB_Scalp_Long", stop=stopLevel, limit=profitLevel, alert_message=alertCloseAll)
+
+if strategy.position_size < 0
+    strategy.exit("Exit_Short", "BB_Scalp_Short", stop=stopLevel, limit=profitLevel, alert_message=alertCloseAll)
+
+// ==========================================
+// VISUALISIERUNG
+// ==========================================
+plot(bbBasis, color=color.new(color.gray, 50), title="BB Basis")
+pUpper = plot(bbUpper, color=color.red, title="BB Upper (2.5 StdDev)")
+pLower = plot(bbLower, color=color.green, title="BB Lower (2.5 StdDev)")
+fill(pUpper, pLower, color=color.new(color.purple, 97), title="Band Background")
+
+// Signal-Pfeile im Chart anzeigen
+plotshape(longCondition and strategy.position_size[1] == 0, title="Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortCondition and strategy.position_size[1] == 0, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)

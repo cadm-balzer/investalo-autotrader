@@ -1,0 +1,98 @@
+//@version=5
+strategy("Supertrend Direct Breakout", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// ==========================================
+// INPUTS & PARAMETER
+// ==========================================
+
+// Supertrend Einstellungen (Standard: 10 / 3)
+stFactor     = input.float(3.0, title="Supertrend Factor", group="Supertrend")
+stPeriod     = input.int(10, title="Supertrend Period", group="Supertrend")
+
+// Risk-Management
+rewardRatio  = input.float(3.0, title="Risk/Reward Ratio (CRV)", group="Risk Management")
+slBuffer     = input.float(5.0, title="SL Buffer (in Points/Pips)", group="Risk Management") / 10
+
+// Zeitfilter
+useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter")
+sessionTime  = input.session("0800-2100:23456", title="Allowed Trading Session", group="Time Filter")
+
+// ==========================================
+// INDIKATOR BERECHNUNG
+// ==========================================
+
+[supertrend, direction] = ta.supertrend(stFactor, stPeriod)
+
+isInSession = not useSession or not na(time(timeframe.period, sessionTime))
+
+// Prüfen, ob der Trend JETZT GERADE in dieser Kerze gewechselt hat
+// direction == -1 ist Grün (Bullisch), direction == 1 ist Rot (Bärisch)
+trendFlipToLong  = (direction == -1 and direction[1] == 1)
+trendFlipToShort = (direction == 1 and direction[1] == -1)
+
+// ==========================================
+// TRADING LOGIK (DIREKTEINSTIEG BEIM FLIP)
+// ==========================================
+
+longCondition  = isInSession and trendFlipToLong
+shortCondition = isInSession and trendFlipToShort
+
+// ==========================================
+// LEVEL SPEICHERUNG FÜR DIE VISUALISIERUNG
+// ==========================================
+
+var float entryPriceLevel = na
+var float slPriceLevel = na
+var float tpPriceLevel = na
+
+if strategy.position_size == 0
+    entryPriceLevel := na
+    slPriceLevel    := na
+    tpPriceLevel    := na
+
+// ==========================================
+// EXECUTION & WEBHOOK PAYLOADS
+// ==========================================
+string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+
+// --- LONG ENTRY ---
+if longCondition and strategy.position_size == 0
+    slPriceLevel    := supertrend - slBuffer
+    entryPriceLevel := close
+    risk            = entryPriceLevel - slPriceLevel
+    tpPriceLevel    := entryPriceLevel + (risk * rewardRatio) // Starres CRV 1:3
+    
+    msgLongEntry = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slPriceLevel) + ', "tp1": ' + str.tostring(tpPriceLevel) + ', "qty_pct": 100}'
+    strategy.entry("ST_Direct_Long", strategy.long, alert_message=msgLongEntry)
+
+// --- SHORT ENTRY ---
+if shortCondition and strategy.position_size == 0
+    slPriceLevel    := supertrend + slBuffer
+    entryPriceLevel := close
+    risk            = slPriceLevel - entryPriceLevel
+    tpPriceLevel    := entryPriceLevel - (risk * rewardRatio) // Starres CRV 1:3
+    
+    msgShortEntry = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slPriceLevel) + ', "tp1": ' + str.tostring(tpPriceLevel) + ', "qty_pct": 100}'
+    strategy.entry("ST_Direct_Short", strategy.short, alert_message=msgShortEntry)
+
+// --- EXITS ---
+if strategy.position_size > 0
+    strategy.exit("Exit_Long", "ST_Direct_Long", stop=slPriceLevel, limit=tpPriceLevel, alert_message=alertCloseAll)
+
+if strategy.position_size < 0
+    strategy.exit("Exit_Short", "ST_Direct_Short", stop=slPriceLevel, limit=tpPriceLevel, alert_message=alertCloseAll)
+
+// ==========================================
+// VISUALISIERUNG
+// ==========================================
+
+plot(supertrend, color = (direction == -1) ? color.green : color.red, linewidth=2, title="Supertrend Line")
+
+// Trade-Level zeichnen
+plot(entryPriceLevel, color=color.blue, style=plot.style_linebr, linewidth=2, title="Direkt-Einstieg")
+plot(slPriceLevel, color=color.red, style=plot.style_linebr, linewidth=1, title="Stop Loss")
+plot(tpPriceLevel, color=color.green, style=plot.style_linebr, linewidth=1, title="Take Profit (1:3)")
+
+// Signale markieren
+plotshape(longCondition and strategy.position_size[1] == 0, title="Breakout Buy", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortCondition and strategy.position_size[1] == 0, title="Breakout Sell", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)

@@ -25,11 +25,12 @@ input group "--- RISK Engine ---"
 input double   InpRiskPercent    = 0.5;                             // Risiko pro Trade (%) vom Kontostand
 input double   InpMaxLotSize     = 10.0;                            // Maximal erlaubte Lot-Größe
 input int      InpPartialClosePct= 50;                             // Teilschließung Fallback (%) wenn Signal kein qty_pct liefert
+input bool     InpEnforcePartialLotCheck = true;                    // Entry nur erlauben, wenn spätere Teilschließung lot-technisch möglich ist
 
 input group "--- SYMBOL MAPPING (TradingView -> Broker) ---"
 // Format: "TV1=BROKER1,TV2=BROKER2"  (z.B. "US500=US500.cash,NAS100=NAS100.cash,GER40=DE40.cash")
 // Leer lassen, wenn die Symbole bei Broker und TradingView identisch sind.
-input string   InpSymbolMap      = "US500=US500.cash,NAS100=NAS100.cash";
+input string   InpSymbolMap      = "SP500=US500.cash,SPX=US500.cash,NAS100=NAS100.cash,BTCUSDT.P=BTCUSD";
 input string   InpSymbolSuffix   = "";                              // Optional: Suffix an ALLE Symbole anhängen (z.B. ".cash")
 
 //--- Globale Variablen ---
@@ -188,6 +189,17 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
       }
       lotSize = CalculateLotSize(symbol, side, sl);
       if(lotSize <= 0) return false;
+
+      // Multi-Target-Setups mit TP2 implizieren spätere Teilschließung.
+      if(tp2 > 0.0 && InpEnforcePartialLotCheck)
+      {
+         if(!CanSupportPartialClose(symbol, lotSize, (int)InpPartialClosePct))
+         {
+            Print("Entry abgelehnt: Lotgröße unterstützt keine spätere Teilschließung. Symbol=", symbol,
+                  " Lot=", DoubleToString(lotSize, 2), " PartialPct=", InpPartialClosePct);
+            return false;
+         }
+      }
    }
 
    // Order-Platzierung – strikt: BUY/SELL = Market JETZT, *_LIMIT = pending
@@ -249,6 +261,28 @@ double CalculateLotSize(string symbol, string action, double slPrice)
 }
 
 //+------------------------------------------------------------------+
+//| Prüft, ob für eine gegebene Lotgröße später sinnvoll teilweise   |
+//| geschlossen werden kann, ohne unter MinLot zu fallen.           |
+//+------------------------------------------------------------------+
+bool CanSupportPartialClose(string symbol, double volume, int pct)
+{
+   if(pct < 1)  pct = 1;
+   if(pct > 99) pct = 99;
+
+   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   if(step <= 0) step = 0.01;
+
+   double requestedCloseVol = MathFloor((volume * pct / 100.0) / step) * step;
+   double maxCloseVol = MathFloor((MathMax(0.0, volume - minVol)) / step) * step;
+
+   if(requestedCloseVol < minVol && maxCloseVol >= minVol)
+      requestedCloseVol = minVol;
+
+   return requestedCloseVol >= minVol && requestedCloseVol <= maxCloseVol;
+}
+
+//+------------------------------------------------------------------+
 //| Schließt alle offenen Positionen eines bestimmten Assets         |
 //+------------------------------------------------------------------+
 bool CloseAllPositionsForSymbol(string symbol)
@@ -291,20 +325,31 @@ bool PartialClosePositions(string symbol, int pct)
       ulong  ticket = PositionGetInteger(POSITION_TICKET);
       double volume = PositionGetDouble(POSITION_VOLUME);
 
-      // Zu schließendes Volumen auf den Lot-Step abrunden
-      double closeVol = MathFloor((volume * pct / 100.0) / step) * step;
+      // Gewünschtes Teilvolumen auf Lot-Step abrunden.
+      double requestedCloseVol = MathFloor((volume * pct / 100.0) / step) * step;
 
-      // Verbleibender Rest unter MinLot -> Position komplett schließen
-      if(volume - closeVol < minVol) closeVol = volume;
+      // Maximal schließbares Volumen, wenn mindestens MinLot offen bleiben soll.
+      double maxCloseVol = MathFloor((MathMax(0.0, volume - minVol)) / step) * step;
+
+      // Wenn die Prozentrechnung unter MinLot fällt, schließen wir best effort MinLot,
+      // aber nur dann, wenn danach noch mindestens MinLot offen bleibt.
+      double closeVol = requestedCloseVol;
+      if(closeVol < minVol && maxCloseVol >= minVol)
+         closeVol = minVol;
+
+      // Nie mehr schließen als zulässig, wenn die Position teilweise offen bleiben soll.
+      if(closeVol > maxCloseVol)
+         closeVol = maxCloseVol;
 
       if(closeVol < minVol)
       {
-         Print("Teilschließung übersprungen (Volumen < MinLot) Ticket ", ticket);
+         allOk = false;
+         Print("Teilschließung nicht möglich: Volume=", DoubleToString(volume, 2),
+               " MinLot=", DoubleToString(minVol, 2), " Ticket ", ticket);
          continue;
       }
 
-      bool ok = (closeVol >= volume) ? trade.PositionClose(ticket)
-                                     : trade.PositionClosePartial(ticket, closeVol);
+      bool ok = trade.PositionClosePartial(ticket, closeVol);
       if(ok)
          Print("Teilschließung OK: ", DoubleToString(closeVol, 2), " von ",
                DoubleToString(volume, 2), " Lot (Ticket ", ticket, ", ", pct, "%)");

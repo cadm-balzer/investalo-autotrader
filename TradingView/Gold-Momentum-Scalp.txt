@@ -1,0 +1,97 @@
+//@version=5
+strategy("Gold & SP500 Momentum Breakout", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+
+// ==========================================
+// INPUTS & PARAMETER
+// ==========================================
+
+// Bollinger Bänder (Als Ausbruchs-Kanäle)
+bbLen        = input.int(20, title="BB Length", group="Bollinger Bands Channel")
+bbMult       = input.float(2.0, title="BB StdDev Multiplier", group="Bollinger Bands Channel", tooltip="Niedrigerer Wert (z.B. 2.0) erlaubt schnellere Ausbruchs-Signale")
+
+// ATR (Volatilitäts- & Impuls-Check)
+atrLen       = input.int(14, title="ATR Length", group="Momentum Filter")
+atrThreshold = input.float(1.2, title="Min. Breakout Candle Size (x ATR)", group="Momentum Filter", tooltip="Die Ausbruchskerze muss dynamisch sein")
+
+// Exit-Parameter (Schnelle Gewinne für die Challenge)
+tpAtrMult    = input.float(1.0, title="Take Profit Multiplier (ATR)", group="Exits")
+slAtrMult    = input.float(1.5, title="Stop Loss Multiplier (ATR)", group="Exits", tooltip="Etwas mehr Luft für den SL, da wir in den Trend einsteigen")
+
+// Zeitfilter (Volatilitäts-Fenster: London + New York Session)
+useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter")
+sessionTime  = input.session("0800-2100:23456", title="Allowed Trading Session", group="Time Filter")
+
+// ==========================================
+// BERECHNUNGEN
+// ==========================================
+
+// Bollinger Bänder (Manuelle Berechnung für v5)
+bbBasis = ta.sma(close, bbLen)
+dev     = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + dev
+bbLower = bbBasis - dev
+
+// ATR & Kerzengröße (High - Low)
+atr = ta.atr(atrLen)
+candleSize = high - low
+
+// Bedingungen prüfen
+isInSession = not useSession or not na(time(timeframe.period, sessionTime))
+isImpulsive = candleSize > (atr * atrThreshold)
+
+// ==========================================
+// MOMENTUM BREAKOUT LOGIK (SCHLUSSKURS-TRIGGER)
+// ==========================================
+
+// LONG: Schlusskurs kreuzt das OBERE Band nach oben + Kerze hat Momentum
+longCondition = isInSession and isImpulsive and ta.crossover(close, bbUpper)
+
+// SHORT: Schlusskurs kreuzt das UNTERE Band nach unten + Kerze hat Momentum
+shortCondition = isInSession and isImpulsive and ta.crossunder(close, bbLower)
+
+// ==========================================
+// EXECUTION & WEBHOOK PAYLOADS
+// ==========================================
+
+var float stopLevel = na
+var float profitLevel = na
+string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
+
+if strategy.position_size == 0
+    stopLevel := na
+    profitLevel := na
+
+// --- LONG ENTRY (Breakout nach oben) ---
+if longCondition and strategy.position_size == 0
+    stopLevel := close - (slAtrMult * atr)
+    profitLevel := close + (tpAtrMult * atr)
+    
+    msgLongEntry = '{"action": "BUY", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(stopLevel) + ', "tp1": ' + str.tostring(profitLevel) + ', "qty_pct": 100}'
+    strategy.entry("Mom_Break_Long", strategy.long, alert_message=msgLongEntry)
+
+// --- SHORT ENTRY (Breakout nach unten) ---
+if shortCondition and strategy.position_size == 0
+    stopLevel := close + (slAtrMult * atr)
+    profitLevel := close - (tpAtrMult * atr)
+    
+    msgShortEntry = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(stopLevel) + ', "tp1": ' + str.tostring(profitLevel) + ', "qty_pct": 100}'
+    strategy.entry("Mom_Break_Short", strategy.short, alert_message=msgShortEntry)
+
+// --- EXITS ---
+if strategy.position_size > 0
+    strategy.exit("Exit_Long", "Mom_Break_Long", stop=stopLevel, limit=profitLevel, alert_message=alertCloseAll)
+
+if strategy.position_size < 0
+    strategy.exit("Exit_Short", "Mom_Break_Short", stop=stopLevel, limit=profitLevel, alert_message=alertCloseAll)
+
+// ==========================================
+// VISUALISIERUNG
+// ==========================================
+plot(bbBasis, color=color.new(color.gray, 50), title="BB Basis")
+pUpper = plot(bbUpper, color=color.green, title="Upper Breakout Band") // Farbe zu Grün geändert, da jetzt Long-Trigger
+pLower = plot(bbLower, color=color.red, title="Lower Breakout Band")    // Farbe zu Rot geändert, da jetzt Short-Trigger
+fill(pUpper, pLower, color=color.new(color.blue, 97), title="Band Background")
+
+// Signal-Pfeile im Chart anzeigen
+plotshape(longCondition and strategy.position_size[1] == 0, title="Momentum Buy", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortCondition and strategy.position_size[1] == 0, title="Momentum Sell", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)

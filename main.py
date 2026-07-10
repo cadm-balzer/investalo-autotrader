@@ -16,12 +16,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -60,19 +60,12 @@ StatusT = Literal["PENDING", "DISPATCHED", "EXECUTED", "FAILED"]
 # ---------------------------------------------------------------------------
 # Pydantic-Modelle
 # ---------------------------------------------------------------------------
-class WebhookPayload(BaseModel):
-    """TradingView-Signal-Payload (strikt validiert)."""
+class SignalBase(BaseModel):
+    """Gemeinsame Felder und Symbol-Validierung für alle Signaltypen."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    action: ActionT
     symbol: str = Field(..., min_length=3, max_length=12)
-    price: float = Field(..., gt=0)
-    sl: float | None = Field(default=None, gt=0)
-    tp1: float | None = Field(default=None, gt=0)
-    tp2: float | None = Field(default=None, gt=0)
-    qty_pct: int = Field(default=100, ge=1, le=100)
-    breakeven: bool = False  # SL nach Teilschließung auf Breakeven ziehen (PARTIAL_CLOSE)
 
     @field_validator("symbol")
     @classmethod
@@ -84,6 +77,34 @@ class WebhookPayload(BaseModel):
         if not all(c in allowed for c in v):
             raise ValueError("symbol must be alphanumeric and may contain '.' or '-'")
         return v
+
+
+class EntryPayload(SignalBase):
+    action: Literal["BUY", "SELL", "BUY_LIMIT", "SELL_LIMIT"]
+    price: float = Field(..., gt=0)
+    sl: float = Field(..., gt=0)
+    tp1: float | None = Field(default=None, gt=0)
+    tp2: float | None = Field(default=None, gt=0)
+    qty_pct: int = Field(default=100, ge=1, le=100)
+    breakeven: bool = False
+
+
+class PartialClosePayload(SignalBase):
+    action: Literal["PARTIAL_CLOSE"]
+    price: float | None = Field(default=None, gt=0)
+    qty_pct: int = Field(..., ge=1, le=99)
+    breakeven: bool = False
+
+
+class ManagementPayload(SignalBase):
+    action: Literal["CLOSE_ALL", "BREAKEVEN"]
+    price: float | None = Field(default=None, gt=0)
+
+
+WebhookPayload = Annotated[
+    EntryPayload | PartialClosePayload | ManagementPayload,
+    Field(discriminator="action"),
+]
 
 
 class AckPayload(BaseModel):
@@ -111,7 +132,7 @@ class StoredSignal(BaseModel):
     created_at: str
     dispatched_at: str | None = None
     acked_at: str | None = None
-    payload: WebhookPayload
+    payload: EntryPayload | PartialClosePayload | ManagementPayload
     result: AckPayload | None = None
 
 
@@ -300,14 +321,20 @@ async def ack(
 async def _validation(request: Request, exc: RequestValidationError) -> JSONResponse:
     """422-Antworten mit Body-Echo loggen – hilft beim Debuggen von MT5/TV-Payloads."""
     raw = await request.body()
+    safe_errors: list[dict[str, Any]] = []
+    for err in exc.errors():
+        safe_err = dict(err)
+        if "ctx" in safe_err and safe_err["ctx"] is not None:
+            safe_err["ctx"] = {k: str(v) for k, v in safe_err["ctx"].items()}
+        safe_errors.append(safe_err)
     log.warning(
         "422 %s %s | body=%r | errors=%s",
         request.method,
         request.url.path,
         raw[:1000],
-        exc.errors(),
+        safe_errors,
     )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 @app.exception_handler(Exception)
