@@ -90,22 +90,41 @@ if strategy.position_size < 0
         slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
 
 // --- EXITS PAYLOADS ---
+// ==========================================
+// ERWEITERTE & GAP-SICHERE EXITS
+// ==========================================
 string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
 string alertPartialClose = '{"action": "PARTIAL_CLOSE", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "qty_pct": ' + str.tostring(partialQtyPct) + ', "breakeven": ' + (moveToBreakeven ? "true" : "false") + '}'
 
-// Exits Long
-if strategy.position_size > 0
+// NOTFALL-MARKET-EXIT (Falls der Kurs am Wochenende durch den SL gapt)
+emergencyExitLong  = strategy.position_size > 0 and close <= slPriceLevel
+emergencyExitShort = strategy.position_size < 0 and close >= slPriceLevel
+
+if emergencyExitLong
+    strategy.close("ST_Direct_Long", comment="Emergency SL Hit", alert_message=alertCloseAll)
+
+if emergencyExitShort
+    strategy.close("ST_Direct_Short", comment="Emergency SL Hit", alert_message=alertCloseAll)
+
+// NORMALE ORDER-EXITS (Wenn alles regulär läuft)
+if strategy.position_size > 0 and not emergencyExitLong
     if not tp1Hit
-        strategy.exit("TP1_Long", "ST_Direct_Long", qty_percent=partialQtyPct, limit=tp1PriceLevel, stop=slPriceLevel, alert_message=alertPartialClose)
+        // TP1 sendet NUR PARTIAL_CLOSE (kein Stop in derselben Exit-Order)
+        strategy.exit("TP1_Long", "ST_Direct_Long", qty_percent=partialQtyPct, limit=tp1PriceLevel, alert_message=alertPartialClose)
+        // Separater Schutz-Stop mit CLOSE_ALL-Alert
+        strategy.exit("SL_Long", "ST_Direct_Long", stop=slPriceLevel, alert_message=alertCloseAll)
     else
         strategy.exit("TP2_Long", "ST_Direct_Long", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
 
-// Exits Short
-if strategy.position_size < 0
+if strategy.position_size < 0 and not emergencyExitShort
     if not tp1Hit
-        strategy.exit("TP1_Short", "ST_Direct_Short", qty_percent=partialQtyPct, limit=tp1PriceLevel, stop=slPriceLevel, alert_message=alertPartialClose)
+        // TP1 sendet NUR PARTIAL_CLOSE (kein Stop in derselben Exit-Order)
+        strategy.exit("TP1_Short", "ST_Direct_Short", qty_percent=partialQtyPct, limit=tp1PriceLevel, alert_message=alertPartialClose)
+        // Separater Schutz-Stop mit CLOSE_ALL-Alert
+        strategy.exit("SL_Short", "ST_Direct_Short", stop=slPriceLevel, alert_message=alertCloseAll)
     else
         strategy.exit("TP2_Short", "ST_Direct_Short", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
+
 
 // ==========================================
 // VISUALISIERUNG
