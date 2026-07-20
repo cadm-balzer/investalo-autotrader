@@ -41,6 +41,7 @@ var float slPriceLevel = na
 var float tp1PriceLevel = na
 var float tp2PriceLevel = na
 var bool tp1Hit = false
+var bool tp1SwitchHandled = false
 
 if strategy.position_size == 0
     entryPriceLevel := na
@@ -48,6 +49,7 @@ if strategy.position_size == 0
     tp1PriceLevel   := na
     tp2PriceLevel   := na
     tp1Hit          := false
+    tp1SwitchHandled := false
 
 // ==========================================
 // EXECUTION & WEBHOOK PAYLOADS
@@ -89,6 +91,15 @@ if strategy.position_size < 0
     if tp1Hit and moveToBreakeven
         slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
 
+// Beim Wechsel von TP1-Phase auf TP2-Phase alte Exit-Orders sauber entfernen.
+// Sonst kann eine bestehende SL-Order die Restmenge reservieren und TP2 blockieren.
+if strategy.position_size != 0 and tp1Hit and not tp1SwitchHandled
+    strategy.cancel("TP1_Long")
+    strategy.cancel("SL_Long")
+    strategy.cancel("TP1_Short")
+    strategy.cancel("SL_Short")
+    tp1SwitchHandled := true
+
 // --- EXITS PAYLOADS ---
 // ==========================================
 // ERWEITERTE & GAP-SICHERE EXITS
@@ -106,8 +117,19 @@ if emergencyExitLong
 if emergencyExitShort
     strategy.close("ST_Direct_Short", comment="Emergency SL Hit", alert_message=alertCloseAll)
 
+// Fallback: Wenn TP2 intra-bar erreicht wird, sende CLOSE_ALL sofort.
+// Das verhindert haengende Restpositionen, falls eine Exit-Order nicht fillt/alertet.
+tp2HitLong  = strategy.position_size > 0 and tp1Hit and high >= tp2PriceLevel
+tp2HitShort = strategy.position_size < 0 and tp1Hit and low <= tp2PriceLevel
+
+if tp2HitLong
+    strategy.close("ST_Direct_Long", comment="TP2 Hit", alert_message=alertCloseAll)
+
+if tp2HitShort
+    strategy.close("ST_Direct_Short", comment="TP2 Hit", alert_message=alertCloseAll)
+
 // NORMALE ORDER-EXITS (Wenn alles regulär läuft)
-if strategy.position_size > 0 and not emergencyExitLong
+if strategy.position_size > 0 and not emergencyExitLong and not tp2HitLong
     if not tp1Hit
         // TP1 sendet NUR PARTIAL_CLOSE (kein Stop in derselben Exit-Order)
         strategy.exit("TP1_Long", "ST_Direct_Long", qty_percent=partialQtyPct, limit=tp1PriceLevel, alert_message=alertPartialClose)
@@ -116,7 +138,7 @@ if strategy.position_size > 0 and not emergencyExitLong
     else
         strategy.exit("TP2_Long", "ST_Direct_Long", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
 
-if strategy.position_size < 0 and not emergencyExitShort
+if strategy.position_size < 0 and not emergencyExitShort and not tp2HitShort
     if not tp1Hit
         // TP1 sendet NUR PARTIAL_CLOSE (kein Stop in derselben Exit-Order)
         strategy.exit("TP1_Short", "ST_Direct_Short", qty_percent=partialQtyPct, limit=tp1PriceLevel, alert_message=alertPartialClose)
