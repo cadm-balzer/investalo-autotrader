@@ -8,6 +8,13 @@ strategy("Supertrend Direct Breakout - CRV Opt", overlay=true, initial_capital=1
 stFactor     = input.float(3.0, title="Supertrend Factor", group="Supertrend")
 stPeriod     = input.int(10, title="Supertrend Period", group="Supertrend")
 
+// --- NEU: VWAP FILTER ---
+useVwapFilter = input.bool(true, title="VWAP Filter nutzen?", group="VWAP Filter")
+vwapBuffer    = input.float(0.0, title="VWAP Buffer (Abstand in Punkten)", tooltip="Kurs muss um diesen Wert klar über/unter VWAP liegen. 0 = deaktiviert.", group="VWAP Filter")
+vwapAllowNa   = input.bool(true, title="Trades erlauben wenn VWAP = na", tooltip="Falls der Datenfeed keinen VWAP liefert, blockiert der Filter sonst alle Signale.", group="VWAP Filter")
+useVwapFallback = input.bool(true, title="VWAP Fallback nutzen (EMA)", tooltip="Wenn ta.vwap keine Werte liefert, wird eine EMA als Proxy genutzt.", group="VWAP Filter")
+vwapFallbackLen = input.int(100, title="VWAP Fallback EMA Länge", minval=1, group="VWAP Filter")
+
 // Zwei Gewinnziele für ein mathematisch sicheres Bestehen der Challenge
 rewardRatio1 = input.float(1.0, title="Risk/Reward TP1 (Teilverkauf)", group="Risk Management")
 rewardRatio2 = input.float(3.0, title="Risk/Reward TP2 (Endziel)", group="Risk Management")
@@ -19,18 +26,29 @@ useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter"
 sessionTime  = input.session("0800-2100:23456", title="Allowed Trading Session", group="Time Filter")
 
 // ==========================================
-// INDIKATOR BERECHNUNG
+// INDIKATOR BERECHNUNG & FILTER
 // ==========================================
 
 [supertrend, direction] = ta.supertrend(stFactor, stPeriod)
+
+// Session-VWAP auf Typical Price
+vwapRaw = ta.vwap(hlc3)
+vwapFallback = ta.ema(hlc3, vwapFallbackLen)
+currentVwap = (not na(vwapRaw)) ? vwapRaw : (useVwapFallback ? vwapFallback : na)
+vwapReady = not na(currentVwap)
 
 isInSession = not useSession or not na(time(timeframe.period, sessionTime))
 
 trendFlipToLong  = (direction == -1 and direction[1] == 1)
 trendFlipToShort = (direction == 1 and direction[1] == -1)
 
-longCondition  = isInSession and trendFlipToLong
-shortCondition = isInSession and trendFlipToShort
+// VWAP Bedingungen
+vwapLongCondition  = not useVwapFilter or ((vwapReady or vwapAllowNa) and (not vwapReady or close > (currentVwap + vwapBuffer)))
+vwapShortCondition = not useVwapFilter or ((vwapReady or vwapAllowNa) and (not vwapReady or close < (currentVwap - vwapBuffer)))
+
+// Finale Einstiegsbedingungen (Trend Flip + Session + VWAP)
+longCondition  = isInSession and trendFlipToLong and vwapLongCondition
+shortCondition = isInSession and trendFlipToShort and vwapShortCondition
 
 // ==========================================
 // LEVEL SPEICHERUNG & BREAK-EVEN LOGIK
@@ -92,7 +110,6 @@ if strategy.position_size < 0
         slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
 
 // Beim Wechsel von TP1-Phase auf TP2-Phase alte Exit-Orders sauber entfernen.
-// Sonst kann eine bestehende SL-Order die Restmenge reservieren und TP2 blockieren.
 if strategy.position_size != 0 and tp1Hit and not tp1SwitchHandled
     strategy.cancel("TP1_Long")
     strategy.cancel("SL_Long")
@@ -107,7 +124,7 @@ if strategy.position_size != 0 and tp1Hit and not tp1SwitchHandled
 string alertCloseAll = '{"action": "CLOSE_ALL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + '}'
 string alertPartialClose = '{"action": "PARTIAL_CLOSE", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "qty_pct": ' + str.tostring(partialQtyPct) + ', "breakeven": ' + (moveToBreakeven ? "true" : "false") + '}'
 
-// NOTFALL-MARKET-EXIT (Falls der Kurs am Wochenende durch den SL gapt)
+// NOTFALL-MARKET-EXIT
 emergencyExitLong  = strategy.position_size > 0 and close <= slPriceLevel
 emergencyExitShort = strategy.position_size < 0 and close >= slPriceLevel
 
@@ -117,8 +134,7 @@ if emergencyExitLong
 if emergencyExitShort
     strategy.close("ST_Direct_Short", comment="Emergency SL Hit", alert_message=alertCloseAll)
 
-// Fallback: Wenn TP2 intra-bar erreicht wird, sende CLOSE_ALL sofort.
-// Das verhindert haengende Restpositionen, falls eine Exit-Order nicht fillt/alertet.
+// Fallback intra-bar
 tp2HitLong  = strategy.position_size > 0 and tp1Hit and high >= tp2PriceLevel
 tp2HitShort = strategy.position_size < 0 and tp1Hit and low <= tp2PriceLevel
 
@@ -128,21 +144,17 @@ if tp2HitLong
 if tp2HitShort
     strategy.close("ST_Direct_Short", comment="TP2 Hit", alert_message=alertCloseAll)
 
-// NORMALE ORDER-EXITS (Wenn alles regulär läuft)
+// NORMALE ORDER-EXITS
 if strategy.position_size > 0 and not emergencyExitLong and not tp2HitLong
     if not tp1Hit
-        // TP1 sendet NUR PARTIAL_CLOSE (kein Stop in derselben Exit-Order)
         strategy.exit("TP1_Long", "ST_Direct_Long", qty_percent=partialQtyPct, limit=tp1PriceLevel, alert_message=alertPartialClose)
-        // Separater Schutz-Stop mit CLOSE_ALL-Alert
         strategy.exit("SL_Long", "ST_Direct_Long", stop=slPriceLevel, alert_message=alertCloseAll)
     else
         strategy.exit("TP2_Long", "ST_Direct_Long", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
 
 if strategy.position_size < 0 and not emergencyExitShort and not tp2HitShort
     if not tp1Hit
-        // TP1 sendet NUR PARTIAL_CLOSE (kein Stop in derselben Exit-Order)
         strategy.exit("TP1_Short", "ST_Direct_Short", qty_percent=partialQtyPct, limit=tp1PriceLevel, alert_message=alertPartialClose)
-        // Separater Schutz-Stop mit CLOSE_ALL-Alert
         strategy.exit("SL_Short", "ST_Direct_Short", stop=slPriceLevel, alert_message=alertCloseAll)
     else
         strategy.exit("TP2_Short", "ST_Direct_Short", limit=tp2PriceLevel, stop=slPriceLevel, alert_message=alertCloseAll)
@@ -154,7 +166,13 @@ if strategy.position_size < 0 and not emergencyExitShort and not tp2HitShort
 
 plot(supertrend, color = (direction == -1) ? color.green : color.red, linewidth=2, title="Supertrend Line")
 
-// Dynamische Level-Linien während des Trades zeichnen
+// VWAP im Chart einzeichnen (Dunkelblau)
+plot(currentVwap, color=color.new(color.blue, 0), title="VWAP", linewidth=2)
+
+// Optionaler Debug-Plot: zeigt den nativen VWAP (falls vorhanden)
+plot(vwapRaw, color=color.new(color.purple, 70), title="VWAP Raw", linewidth=1)
+
+// Dynamische Level-Linien
 plot(strategy.position_size != 0 ? entryPriceLevel : na, color=color.blue, style=plot.style_linebr, linewidth=2, title="Einstieg")
 plot(strategy.position_size != 0 ? slPriceLevel : na, color=color.red, style=plot.style_linebr, linewidth=1, title="Aktueller SL")
 plot(strategy.position_size != 0 ? tp1PriceLevel : na, color=color.orange, style=plot.style_linebr, linewidth=1, title="Teilziel TP1")
