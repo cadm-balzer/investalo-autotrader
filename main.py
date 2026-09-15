@@ -32,6 +32,15 @@ SIGNALS_FILE = DATA_DIR / "signals.json"
 HISTORY_FILE = DATA_DIR / "signals_history.json"
 TOKENS_FILE = Path(os.getenv("TOKENS_FILE", BASE_DIR / "tokens.json"))
 
+# Stale-Dispatch-Recovery: DISPATCHED-Signale ohne Ack nach STALE_DISPATCH_SECONDS
+# werden beim nächsten Poll zurück in die Queue gestellt (Re-Dispatch); nach
+# MAX_DISPATCH_ATTEMPTS vergeblichen Zustellversuchen -> FAILED + Archiv.
+# Hintergrund: Der EA setzt den Signalstatus nur per Ack zurück – geht der Poll-
+# Response verloren (z. B. WebRequest-Timeout im EA), bleibt das Signal sonst
+# für immer in DISPATCHED hängen und wird nie ausgeführt.
+STALE_DISPATCH_SECONDS = int(os.getenv("STALE_DISPATCH_SECONDS", "90"))
+MAX_DISPATCH_ATTEMPTS = int(os.getenv("MAX_DISPATCH_ATTEMPTS", "3"))
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -132,6 +141,7 @@ class StoredSignal(BaseModel):
     created_at: str
     dispatched_at: str | None = None
     acked_at: str | None = None
+    attempts: int = 0  # Anzahl Zustellversuche (inkl. Stale-Re-Dispatch)
     payload: EntryPayload | PartialClosePayload | ManagementPayload
     result: AckPayload | None = None
 
@@ -270,18 +280,77 @@ async def webhook(payload: WebhookPayload, token: str = Depends(auth_query)) -> 
     return {"signal_id": signal.signal_id, "status": signal.status}
 
 
+def _dispatch_age_seconds(sig: dict[str, Any], now: datetime) -> float | None:
+    """Sekunden seit DISPATCHED (None = nicht ermittelbar -> kein Re-Dispatch)."""
+    dispatched_at = sig.get("dispatched_at")
+    if not dispatched_at:
+        return None
+    try:
+        return (now - datetime.fromisoformat(dispatched_at)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
 @app.get("/v1/signals/poll", tags=["signals"])
 async def poll(token: str = Depends(auth_header)) -> list[dict[str, Any]]:
-    """MT5 EA -> nächstes PENDING-Signal holen (FIFO) und auf DISPATCHED setzen."""
+    """MT5 EA -> nächstes PENDING-Signal holen (FIFO) und auf DISPATCHED setzen.
+
+    Stale-Recovery: DISPATCHED-Signale ohne Ack nach STALE_DISPATCH_SECONDS
+    zurück in die Queue stellen (Re-Dispatch, Attempt-Counter hochzählen).
+    Nach MAX_DISPATCH_ATTEMPTS vergeblichen Versuchen -> FAILED + Archiv,
+    damit die Queue nicht endlos mit einem nicht ausführbaren Signal blockiert.
+    """
     async with _file_lock:
         store = await _load_store()
         bucket = store["tokens"].get(token, {"signals": []})
+        now = datetime.now(timezone.utc)
+
+        # 1) Stale DISPATCHED ohne Ack -> requeue oder aufgeben
         for sig in bucket["signals"]:
-            if sig["status"] == "PENDING":
+            if sig.get("status") != "DISPATCHED":
+                continue
+            age = _dispatch_age_seconds(sig, now)
+            if age is None or age <= STALE_DISPATCH_SECONDS:
+                continue
+            attempts = int(sig.get("attempts") or 0)
+            if attempts >= MAX_DISPATCH_ATTEMPTS:
+                sig["status"] = "FAILED"
+                sig["acked_at"] = _now_iso()
+                sig["result"] = {
+                    "success": False,
+                    "error_message": (
+                        f"stale dispatch: kein Ack nach {attempts} Zustellversuchen"
+                    ),
+                }
+                bucket["signals"] = [
+                    s for s in bucket["signals"] if s["signal_id"] != sig["signal_id"]
+                ]
+                await _save_store(store)
+                await _archive(sig)
+                log.error(
+                    "stale-dispatch %s/%s -> FAILED (kein Ack nach %d Versuchen)",
+                    token[:8], sig["signal_id"], attempts,
+                )
+            else:
+                sig["status"] = "PENDING"
+                await _save_store(store)
+                log.warning(
+                    "stale-dispatch %s/%s -> requeued (Versuch %d/%d, %.0fs ohne Ack)",
+                    token[:8], sig["signal_id"], attempts + 1,
+                    MAX_DISPATCH_ATTEMPTS, age,
+                )
+
+        # 2) nächstes PENDING ausliefern (FIFO)
+        for sig in bucket["signals"]:
+            if sig.get("status") == "PENDING":
                 sig["status"] = "DISPATCHED"
                 sig["dispatched_at"] = _now_iso()
+                sig["attempts"] = int(sig.get("attempts") or 0) + 1
                 await _save_store(store)
-                log.info("dispatch %s/%s -> MT5", token[:8], sig["signal_id"])
+                log.info(
+                    "dispatch %s/%s -> MT5 (Versuch %d)",
+                    token[:8], sig["signal_id"], sig["attempts"],
+                )
                 return [sig]
     return []
 

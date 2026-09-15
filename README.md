@@ -43,6 +43,16 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+## Konfiguration (Umgebungsvariablen)
+
+| Variable                 | Default    | Zweck                                              |
+| ------------------------ | ---------- | -------------------------------------------------- |
+| `DATA_DIR`               | `./data`   | Ablage `signals.json` / `signals_history.json`     |
+| `TOKENS_FILE`            | `./tokens.json` | API-Tokens                                    |
+| `LOG_LEVEL`              | `INFO`     | Log-Level                                          |
+| `STALE_DISPATCH_SECONDS` | `90`       | `DISPATCHED` ohne Ack nach X s → Re-Dispatch       |
+| `MAX_DISPATCH_ATTEMPTS`  | `3`        | Nach N Zustellversuchen → `FAILED` + Archiv        |
+
 ## Datenhaltung
 
 - `./data/signals.json` – aktive Queue (Bind-Mount, host-sichtbar)
@@ -67,6 +77,19 @@ JSON-Body wie oben in das Alert-„Message“-Feld einsetzen.
 
 MT5 EA pollt 500–1000 ms. `/poll` liefert FIFO ein Signal pro Aufruf;
 leere Queue → `200 []` (kein 404).
+
+**Stale-Re-Dispatch:** Wird ein Signal per `/poll` ausgeliefert (`DISPATCHED`), aber nie geackt
+(z. B. weil die Response den EA-WebRequest-Timeout nicht schafft), stellt der Gateway es nach
+`STALE_DISPATCH_SECONDS` beim nächsten Poll erneut zu. Nach `MAX_DISPATCH_ATTEMPTS` vergeblichen
+Versuchen geht es als `FAILED` (Fehlermeldung „stale dispatch …“) ins Archiv. Merkregel: Die
+`dispatch`-Logzeile bedeutet „ausgeliefert“, verlässlich ist nur der `ack`-Logeintrag.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ## MT EA
 

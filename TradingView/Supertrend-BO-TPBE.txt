@@ -1,5 +1,5 @@
 //@version=5
-strategy("Supertrend Direct Breakout - CRV Opt", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD)
+strategy("Supertrend Direct Breakout - CRV Opt", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, currency=currency.USD, slippage=10)
 
 // ==========================================
 // INPUTS & PARAMETER
@@ -15,12 +15,22 @@ vwapAllowNa   = input.bool(true, title="Trades erlauben wenn VWAP = na", tooltip
 useVwapFallback = input.bool(true, title="VWAP Fallback nutzen (EMA)", tooltip="Wenn ta.vwap keine Werte liefert, wird eine EMA als Proxy genutzt.", group="VWAP Filter")
 vwapFallbackLen = input.int(100, title="VWAP Fallback EMA Länge", minval=1, group="VWAP Filter")
 
+// --- NEU: REGIME FILTER (Chop vermeiden) ---
+useHtfFilter = input.bool(true, title="HTF-Trendfilter nutzen?", tooltip="Long nur wenn Kurs über der EMA des höheren Timeframes, Short nur darunter.", group="Regime Filter")
+htfTf        = input.timeframe("15", title="HTF Timeframe", group="Regime Filter")
+htfEmaLen    = input.int(50, title="HTF EMA Länge", minval=1, group="Regime Filter")
+useAdxFilter = input.bool(true, title="ADX-Filter nutzen?", tooltip="Blockiert Flips im Seitwärtsmarkt – dort entstehen die meisten Whipsaw-Verluste.", group="Regime Filter")
+adxLen       = input.int(14, title="ADX Länge", minval=1, group="Regime Filter")
+adxMin       = input.float(20.0, title="ADX Minimum", minval=5, maxval=50, step=1, group="Regime Filter")
+
 // Zwei Gewinnziele für ein mathematisch sicheres Bestehen der Challenge
 rewardRatio1 = input.float(1.0, title="Risk/Reward TP1 (Teilverkauf)", group="Risk Management")
 rewardRatio2 = input.float(3.0, title="Risk/Reward TP2 (Endziel)", group="Risk Management")
 slBuffer     = input.float(5.0, title="SL Buffer (in Points/Pips)", group="Risk Management") / 10
+beCrvTrigger = input.float(0.5, title="Break-even Trigger CRV (z.B. 0.25 / 0.50)", minval=0.05, maxval=3.0, step=0.05, tooltip="CRV-Level, bei dem der SL auf Break-even + Offset gesetzt wird.", group="Risk Management")
+beOffset     = input.float(1.0, title="Break-even Offset (Points/Pips)", group="Risk Management") / 10
 partialQtyPct = input.int(50, title="TP1 Teilverkauf (%)", options=[25, 50, 75], group="Risk Management")
-moveToBreakeven = input.bool(true, title="Nach TP1 Stop auf Breakeven", group="Risk Management")
+moveToBreakeven = input.bool(true, title="Break-even bei CRV-Trigger aktiv", group="Risk Management")
 
 useSession   = input.bool(true, title="Use Session Filter?", group="Time Filter")
 sessionTime  = input.session("0800-2100:23456", title="Allowed Trading Session", group="Time Filter")
@@ -39,6 +49,13 @@ vwapReady = not na(currentVwap)
 
 isInSession = not useSession or not na(time(timeframe.period, sessionTime))
 
+// Regime-Filter: HTF-Trend + ADX
+htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+htfLongOk  = not useHtfFilter or (not na(htfEma) and close > htfEma)
+htfShortOk = not useHtfFilter or (not na(htfEma) and close < htfEma)
+adxOk      = not useAdxFilter or adxValue >= adxMin
+
 trendFlipToLong  = (direction == -1 and direction[1] == 1)
 trendFlipToShort = (direction == 1 and direction[1] == -1)
 
@@ -46,9 +63,9 @@ trendFlipToShort = (direction == 1 and direction[1] == -1)
 vwapLongCondition  = not useVwapFilter or ((vwapReady or vwapAllowNa) and (not vwapReady or close > (currentVwap + vwapBuffer)))
 vwapShortCondition = not useVwapFilter or ((vwapReady or vwapAllowNa) and (not vwapReady or close < (currentVwap - vwapBuffer)))
 
-// Finale Einstiegsbedingungen (Trend Flip + Session + VWAP)
-longCondition  = isInSession and trendFlipToLong and vwapLongCondition
-shortCondition = isInSession and trendFlipToShort and vwapShortCondition
+// Finale Einstiegsbedingungen (Trend Flip + Session + VWAP + Regime)
+longCondition  = isInSession and trendFlipToLong and vwapLongCondition and htfLongOk and adxOk
+shortCondition = isInSession and trendFlipToShort and vwapShortCondition and htfShortOk and adxOk
 
 // ==========================================
 // LEVEL SPEICHERUNG & BREAK-EVEN LOGIK
@@ -56,16 +73,20 @@ shortCondition = isInSession and trendFlipToShort and vwapShortCondition
 
 var float entryPriceLevel = na
 var float slPriceLevel = na
+var float beTriggerPriceLevel = na
 var float tp1PriceLevel = na
 var float tp2PriceLevel = na
+var bool beMoved = false
 var bool tp1Hit = false
 var bool tp1SwitchHandled = false
 
 if strategy.position_size == 0
     entryPriceLevel := na
     slPriceLevel    := na
+    beTriggerPriceLevel := na
     tp1PriceLevel   := na
     tp2PriceLevel   := na
+    beMoved         := false
     tp1Hit          := false
     tp1SwitchHandled := false
 
@@ -78,6 +99,7 @@ if longCondition and strategy.position_size == 0
     slPriceLevel    := supertrend - slBuffer
     entryPriceLevel := close
     risk            = entryPriceLevel - slPriceLevel
+    beTriggerPriceLevel := entryPriceLevel + (risk * beCrvTrigger) // CRV 0.5 -> risk free Trigger
     tp1PriceLevel   := entryPriceLevel + (risk * rewardRatio1) // TP1 bei 1:1
     tp2PriceLevel   := entryPriceLevel + (risk * rewardRatio2) // TP2 bei 1:3
     
@@ -90,24 +112,29 @@ if shortCondition and strategy.position_size == 0
     slPriceLevel    := supertrend + slBuffer
     entryPriceLevel := close
     risk            = slPriceLevel - entryPriceLevel
+    beTriggerPriceLevel := entryPriceLevel - (risk * beCrvTrigger) // CRV 0.5 -> risk free Trigger
     tp1PriceLevel   := entryPriceLevel - (risk * rewardRatio1)
     tp2PriceLevel   := entryPriceLevel - (risk * rewardRatio2)
     
     msgShortEntry = '{"action": "SELL", "symbol": "' + syminfo.ticker + '", "price": ' + str.tostring(close) + ', "sl": ' + str.tostring(slPriceLevel) + ', "tp1": ' + str.tostring(tp1PriceLevel) + ', "tp2": ' + str.tostring(tp2PriceLevel) + ', "qty_pct": 100}'
     strategy.entry("ST_Direct_Short", strategy.short, alert_message=msgShortEntry)
 
-// --- TRAILING / BREAK-EVEN AKTIVIERUNG IM TESTER ---
+// --- BREAK-EVEN und TP-Phasen ---
 if strategy.position_size > 0
+    if not beMoved and high >= beTriggerPriceLevel
+        beMoved := true
+    if beMoved and moveToBreakeven
+        slPriceLevel := entryPriceLevel + beOffset // leicht ueber Einstieg fuer Gebuehren
     if high >= tp1PriceLevel
         tp1Hit := true
-    if tp1Hit and moveToBreakeven
-        slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
 
 if strategy.position_size < 0
+    if not beMoved and low <= beTriggerPriceLevel
+        beMoved := true
+    if beMoved and moveToBreakeven
+        slPriceLevel := entryPriceLevel - beOffset // leicht unter Einstieg fuer Gebuehren
     if low <= tp1PriceLevel
         tp1Hit := true
-    if tp1Hit and moveToBreakeven
-        slPriceLevel := strategy.position_avg_price // SL auf Einstand ziehen
 
 // Beim Wechsel von TP1-Phase auf TP2-Phase alte Exit-Orders sauber entfernen.
 if strategy.position_size != 0 and tp1Hit and not tp1SwitchHandled
@@ -171,6 +198,9 @@ plot(currentVwap, color=color.new(color.blue, 0), title="VWAP", linewidth=2)
 
 // Optionaler Debug-Plot: zeigt den nativen VWAP (falls vorhanden)
 plot(vwapRaw, color=color.new(color.purple, 70), title="VWAP Raw", linewidth=1)
+
+// HTF-Trendlinie
+plot(useHtfFilter ? htfEma : na, color=color.new(color.yellow, 30), title="HTF EMA", linewidth=2)
 
 // Dynamische Level-Linien
 plot(strategy.position_size != 0 ? entryPriceLevel : na, color=color.blue, style=plot.style_linebr, linewidth=2, title="Einstieg")
