@@ -59,6 +59,7 @@
 
 
 CTrade trade;
+#include "InvestaloIdempotency.mqh"
 
 
 
@@ -178,6 +179,7 @@ int OnInit()
 
 
 
+   trade.SetAsyncMode(false);
    trade.SetExpertMagicNumber(133723); // Eigene MagicNumber zur Identifikation
 
 
@@ -530,7 +532,9 @@ void FetchAndExecuteSignals()
 
 
 
-      bool success = ProcessTrade(action, symbol, price, sl, tp1, tp2, qtyPct, beFlag);
+      bool success = false;
+      if(!ExecuteOnce(signalId, action, symbol, price, sl, tp1, tp2, qtyPct, beFlag, success))
+         return; // Unklar/gesperrt: niemals erneut handeln oder Erfolg behaupten.
 
 
 
@@ -838,7 +842,7 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
 
 
 
-      return trade.Buy(lotSize, symbol, currentAsk, sl, orderTp);
+      return trade.Buy(lotSize, symbol, currentAsk, sl, orderTp, signalComment) && BrokerAccepted();
 
 
 
@@ -854,7 +858,7 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
 
 
 
-      return trade.BuyLimit(lotSize, price, symbol, sl, orderTp, ORDER_TIME_DAY);
+      return trade.BuyLimit(lotSize, price, symbol, sl, orderTp, ORDER_TIME_DAY, 0, signalComment) && BrokerAccepted();
 
 
 
@@ -874,7 +878,7 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
 
 
 
-      return trade.Sell(lotSize, symbol, currentBid, sl, orderTp);
+      return trade.Sell(lotSize, symbol, currentBid, sl, orderTp, signalComment) && BrokerAccepted();
 
 
 
@@ -890,7 +894,7 @@ bool ProcessTrade(string action, string symbol, double price, double sl, double 
 
 
 
-      return trade.SellLimit(lotSize, price, symbol, sl, orderTp, ORDER_TIME_DAY);
+      return trade.SellLimit(lotSize, price, symbol, sl, orderTp, ORDER_TIME_DAY, 0, signalComment) && BrokerAccepted();
 
 
 
@@ -1186,7 +1190,7 @@ bool CloseAllPositionsForSymbol(string symbol)
 
 
 
-         if(!trade.PositionClose(ticket))
+         if(!trade.PositionClose(ticket) || !BrokerAccepted())
 
 
 
@@ -1410,7 +1414,7 @@ bool PartialClosePositions(string symbol, int pct)
 
 
 
-      bool ok = trade.PositionClosePartial(ticket, closeVol);
+      bool ok = trade.PositionClosePartial(ticket, closeVol) && BrokerAccepted();
 
 
 
@@ -1548,7 +1552,7 @@ bool MoveToBreakeven(string symbol)
 
 
 
-            if(!trade.PositionModify(ticket, openPrice, currentTP))
+            if(!trade.PositionModify(ticket, openPrice, currentTP) || !BrokerAccepted())
 
 
 
