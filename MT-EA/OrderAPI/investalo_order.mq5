@@ -574,7 +574,7 @@ void FetchAndExecuteSignals()
 
 
 
-bool ProcessTrade(string action, string symbol, double price, double sl, double tp1, double tp2, int qtyPct, bool breakeven)
+bool ProcessTrade(string action, string symbol, double price, double sl, double tp1, double tp2, int qtyPct, bool breakeven, string signalComment)
 
 
 
